@@ -32,6 +32,7 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 	if err != nil {
 		return err
 	}
+	c.bindProxy(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -104,6 +105,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	if err != nil {
 		return err
 	}
+	c.bindProxy(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")

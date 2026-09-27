@@ -478,16 +478,20 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if c.ChatHTTP.Timeout != 0 {
 		t.Errorf("ChatHTTP.Timeout=%v want 0 (no total cap)", c.ChatHTTP.Timeout)
 	}
-	// 共享同一个 Transport 实例，连接池不重复。
+	// 共享同一个 Transport 实例，连接池不重复（现为 proxyTLSRouter：内部两条
+	// *http.Transport，仅 TLS 校验不同，见 router.go）。
 	if c.ChatHTTP.Transport != c.HTTP.Transport {
-		t.Errorf("ChatHTTP and HTTP must share the same *http.Transport")
+		t.Errorf("ChatHTTP and HTTP must share the same Transport")
 	}
-	htr, ok := c.ChatHTTP.Transport.(*http.Transport)
+	router, ok := c.ChatHTTP.Transport.(*proxyTLSRouter)
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
-	if htr.ResponseHeaderTimeout != 60*time.Second { // 连接层加固：响应头上限从 120s 收到 60s（慢冷启动留 3.75× 余量）
-		t.Errorf("ResponseHeaderTimeout=%v want 60s", htr.ResponseHeaderTimeout)
+	if router.secure == router.insecure {
+		t.Fatal("secure 与 insecure 应为两条独立 Transport")
+	}
+	if got := router.secure.ResponseHeaderTimeout; got != 60*time.Second { // 连接层加固：响应头上限从 120s 收到 60s（慢冷启动留 3.75× 余量）
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", got)
 	}
 }
 

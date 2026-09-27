@@ -94,7 +94,7 @@ body {
 .qgroup header .nm { font-weight: 600; font-size: 13.5px; }
 .qgroup header .cnt { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .qrow {
-  display: grid; grid-template-columns: 118px 1fr 52px 84px minmax(120px, 240px);
+  display: grid; grid-template-columns: minmax(88px, 118px) 1fr 52px 84px minmax(100px, 260px);
   gap: 10px; align-items: center; padding: 7.5px 16px; font-size: 13px;
 }
 .qrow:hover { background: var(--surface-2); }
@@ -122,7 +122,7 @@ body {
   font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft);
 }
 .shead .stasks span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stasks { display: grid; grid-template-columns: repeat(5, minmax(64px, 1fr)); gap: 6px 10px; }
+.stasks { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 6px 10px; }
 .stask { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
 .stask .mark { font-size: 13px; line-height: 1; width: 14px; text-align: center; flex: none; }
 .stask.ok .mark { color: var(--ok); }
@@ -137,14 +137,16 @@ body {
 
 .main { min-width: 0; display: flex; flex-direction: column; }
 .topbar {
-  display: flex; align-items: center; gap: 14px; padding: 14px 24px;
+  display: flex; align-items: center; gap: 14px; padding: 14px clamp(14px, 2vw, 44px);
   border-bottom: 1px solid var(--line); background: var(--surface); position: sticky; top: 0; z-index: 20;
 }
 .topbar h2 { font-size: 15.5px; font-weight: 620; letter-spacing: -.01em; }
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1180px; width: 100%; }
+/* 自适应主视图：不设固定宽度上限，内容随窗口伸缩；左右留白按视口宽度自适应
+   （窄屏收紧到 14px 省空间、宽屏放宽到 44px 不贴边）。 */
+.view { padding: clamp(16px, 1.7vw, 36px) clamp(14px, 2vw, 44px) 60px; width: 100%; margin: 0 auto; }
 .view[hidden] { display: none; }
 
 /* ── 控件 ─────────────────────────────────────────────────────────── */
@@ -190,7 +192,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 .box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
-.box > header { display: flex; align-items: center; gap: 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
+.box > header { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
 .box > header h3 { font-size: 13.5px; font-weight: 600; }
 .box > header h3 .hint { font-size: 11.5px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
 .box > header .grow { flex: 1; }
@@ -284,9 +286,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #logBox .ln.w { color: var(--warn); }
 
 /* ── 配置表单 ─────────────────────────────────────────────────────── */
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
-.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 16px; }
-@media (max-width: 860px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+/* 表单栅格自适应：列数随可用宽度自动增减（auto-fit + minmax），窄屏自动折成单列、
+   宽屏自动增列——避免超宽屏把单个输入框拉到上千像素。min(100%, Npx) 保证窄屏不溢出。 */
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 0 20px; }
+.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 0 16px; }
 fieldset { border: none; margin-bottom: 6px; }
 legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom: 10px; }
 .hr { height: 1px; background: var(--line-soft); margin: 4px 0 16px; }
@@ -305,7 +308,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
 .dlg {
   background: var(--surface); border: 1px solid var(--line); border-radius: 13px;
-  width: 560px; max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
+  width: min(560px, 100%); max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
   box-shadow: 0 24px 64px -24px rgba(0,0,0,.6);
 }
 .dlg header { padding: 17px 20px 13px; border-bottom: 1px solid var(--line-soft); }
@@ -408,6 +411,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pk-legend span { display: flex; align-items: center; gap: 5px; }
   .pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
 
+  /* ── 接入页：代码块 ────────────────────────────────────────── */
+  pre.code {
+    margin: 0 0 12px; padding: 12px 14px; overflow-x: auto;
+    font: 12.5px/1.7 var(--mono); color: var(--ink-2);
+    background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: 8px;
+    white-space: pre;
+  }
+  pre.code:last-child { margin-bottom: 0; }
+  #epModels .mid { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+
+  /* ── 代理池 ───────────────────────────────────────────────── */
+  textarea.ta {
+    font: 12.5px/1.7 var(--mono); color: var(--ink); background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px;
+    width: 100%; resize: vertical; white-space: pre; overflow-x: auto;
+  }
+  textarea.ta:focus { outline: none; border-color: var(--accent); }
+  .px .addr { font-family: var(--mono); font-size: 12.5px; word-break: break-all; min-width: 230px; }
+  .px .accts { font-size: 12px; color: var(--ink-2); min-width: 84px; font-variant-numeric: tabular-nums; }
+  .px .who .nm { max-width: 190px; }
 </style>
 </head>
 <body>
@@ -421,6 +444,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#accounts" data-view="accounts" class="on">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
         账号池</a></li>
+      <li><a href="#proxies" data-view="proxies">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.9c1.5 0 2.2 1 3.4 1.4 1.1.4 2.3.2 2.3.2v4.2c0 2.9-2.3 4.8-5.7 5.4-3.4-.6-5.7-2.5-5.7-5.4V3.5s1.2.2 2.3-.2C5.8 2.9 6.5 1.9 8 1.9z"/><path d="M8 5.2v5M5.6 7.3h4.8"/></svg>
+        代理池</a></li>
+      <li><a href="#endpoint" data-view="endpoint">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6.2 3.2 3 8l3.2 4.8M9.8 3.2 13 8l-3.2 4.8"/></svg>
+        接入</a></li>
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
@@ -485,10 +514,182 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>代理</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 代理池 -->
+    <section class="view" id="view-proxies" hidden>
+      <div class="stats">
+        <div class="stat"><div class="v" id="pxTotal">-</div><div class="k">代理总数</div></div>
+        <div class="stat good"><div class="v" id="pxHealthy">-</div><div class="k">最近探测可用</div></div>
+        <div class="stat"><div class="v" id="pxAssigned">-</div><div class="k">已指定代理</div></div>
+        <div class="stat"><div class="v" id="pxDirect">-</div><div class="k">直连账号</div></div>
+        <div class="stat"><div class="v" id="pxAccts">-</div><div class="k">账号总数</div></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>批量添加 socks5 代理</h3>
+          <span class="grow"></span>
+          <span class="note">每行一条 · 空行与 # 开头为注释 · 重复地址自动去重</span>
+        </header>
+        <div class="pad">
+          <textarea id="pxText" class="ta" rows="6" spellcheck="false"
+            placeholder="socks5://user:pass@1.2.3.4:1080&#10;5.6.7.8:1080&#10;user:pass@9.9.9.9:1080&#10;10.0.0.1:1080:user:pass|香港01"></textarea>
+          <div class="inline" style="margin-top:11px">
+            <button class="xs primary" id="btnPxAdd">添加到代理池</button>
+            <button class="xs" id="btnPxCheckAll">全部测试连通性</button>
+            <button class="xs danger" id="btnPxClear">清空代理池</button>
+            <span class="note" id="pxAddNote"></span>
+          </div>
+          <div class="hint" style="margin-top:9px;font-size:11.5px;color:var(--ink-3)">
+            支持写法：socks5://user:pass@host:port ｜ host:port ｜ user:pass@host:port ｜ host:port:user:pass ｜ 竖线后接备注。
+            指定给账号后，该账号的全部出站（对话 / 余额 / 签到 / 事件上报）都经该代理。
+            代理会 MITM 掉 443（报 x509 证书过期/自签）时，在行尾再加 <code>|insecure</code>（如 <code>host:port|香港01|insecure</code>），
+            只让经该代理的请求免证书校验；也可以添加后在表格里点「免校验」。
+          </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>一键配置</h3>
+          <span class="grow"></span>
+          <span class="note">保存即生效：下一个出站请求就走新代理，无需重启</span>
+        </header>
+        <div class="pad">
+          <div class="grid3">
+            <label class="fld"><span class="lb">配置方式</span>
+              <select id="pxMode">
+                <option value="order">按 IP 顺序配置（第 1 个账号用第 1 个 IP，依次类推）</option>
+                <option value="same">同一个 IP（选定代理给全部账号）</option>
+                <option value="clear">一键清除（清掉分配，保留代理列表）</option>
+              </select>
+            </label>
+            <label class="fld" id="pxSameWrap"><span class="lb">选择代理（同一个 IP 时生效）</span>
+              <select id="pxSameAddr"></select>
+            </label>
+            <label class="fld"><span class="lb">作用范围</span>
+              <select id="pxOnly">
+                <option value="0">全部账号（覆盖已有分配）</option>
+                <option value="1">仅未分配的账号（保留手动指定）</option>
+              </select>
+            </label>
+          </div>
+          <div class="inline">
+            <button class="xs primary" id="btnPxBulk">执行一键配置</button>
+            <span class="note" id="pxBulkNote"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>代理列表</h3>
+          <span class="grow"></span>
+          <span class="note" id="pxNote">—</span>
+          <button class="xs" id="btnPxReload">刷新</button>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc px">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>代理地址</th><th>备注</th><th>最近探测</th><th>分配账号</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="pxBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>账号 → 代理</h3>
+          <span class="grow"></span>
+          <span class="note">未指定的账号直连（与未启用代理池时行为一致）</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc px">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>账号</th><th>代理</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="pxAccBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 接入（客户端怎么连这个网关） -->
+    <section class="view" id="view-endpoint" hidden>
+      <div class="box">
+        <header>
+          <h3>接入信息</h3>
+          <span class="grow"></span>
+          <span class="note">OpenAI 兼容 · /v1/chat/completions + /v1/responses</span>
+        </header>
+        <div class="pad">
+          <div class="grid2">
+            <label class="fld"><span class="lb">Base URL</span>
+              <input id="epBase" readonly><span class="hint">同网段其它设备把 127.0.0.1 换成本机 IP（见下）</span></label>
+            <label class="fld"><span class="lb">API Key</span>
+              <input id="epKey" readonly><span class="hint">config.json 的 api_key；为空 = 不鉴权（直接留空）</span></label>
+          </div>
+          <div class="inline">
+            <button class="xs primary" id="btnEpCodex">复制 Codex 配置</button>
+            <button class="xs" id="btnEpCurl">复制 curl 示例</button>
+            <button class="xs" id="btnEpPy">复制 Python 示例</button>
+            <span class="note" id="epNote"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>Codex 配置</h3>
+          <span class="hint">~/.codex/config.toml</span>
+          <span class="grow"></span>
+          <button class="xs" id="btnEpCopyToml">复制</button>
+        </header>
+        <div class="pad">
+          <pre class="code" id="epCodex"></pre>
+          <div class="hint" style="margin-top:9px">
+            两处关键点：① <code>wire_api = "responses"</code> —— Codex 0.155+ 只支持 Responses 协议，
+            本网关已内置 <code>/v1/responses</code> 适配（请求与响应双向翻译后复用 Chat Completions 主链路）；
+            ② 密钥走环境变量，先 <code>export WB2API_KEY=&lt;上面的 API Key&gt;</code> 再启动 codex。
+            保存后 <code>codex</code> 即可用；<code>codex exec "你好"</code> 可快速自检。
+          </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header><h3>其它客户端</h3><span class="grow"></span><span class="note">任何 OpenAI 兼容客户端都能接</span></header>
+        <div class="pad">
+          <div class="hint" style="margin-bottom:9px">Base URL 填上面的地址、API Key 填上面的密钥、模型名从下表选（<code>cn:</code> / <code>global:</code> 前缀是网关的域路由协议，必须带）。</div>
+          <pre class="code" id="epCurl"></pre>
+          <pre class="code" id="epPy"></pre>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>可用模型</h3>
+          <span class="grow"></span>
+          <span class="note" id="epModelsNote">—</span>
+          <button class="xs" id="btnEpModels">刷新</button>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>模型名（填进客户端）</th><th>上下文</th><th class="num">倍率</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="epModels"></tbody>
+          </table>
         </div>
       </div>
     </section>
@@ -785,6 +986,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
+            <div class="switch"><span class="lb">出站跳过 TLS 证书校验（全局 · 热生效）</span>
+              <input type="checkbox" name="tls_skip_verify"></div>
+            <div class="hint" style="margin-top:-4px;margin-bottom:10px">上游链路被代理 MITM（报 x509 证书过期/自签）时才开；更细的粒度用「代理池」里单条代理的「免校验」开关。</div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
@@ -823,7 +1027,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <!-- 积分任务 -->
 <div class="veil" id="taskVeil">
-  <div class="dlg" style="width:940px">
+  <div class="dlg" style="width:min(940px, 100%)">
     <header>
       <h3>积分任务 <span class="hint" id="taskWho"></span></h3>
       <div class="hint">查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。</div>
@@ -860,6 +1064,27 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <span class="grow"></span>
       <button class="xs" id="btnVcRefresh">刷新</button>
       <button class="xs primary" id="btnVcClose">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 指定代理 -->
+<div class="veil" id="proxyVeil">
+  <div class="dlg" style="width:min(540px, 100%)">
+    <header>
+      <h3>指定代理</h3>
+      <div class="hint" id="proxyWho">—</div>
+    </header>
+    <div class="body">
+      <label class="fld"><span class="lb">该账号使用的代理</span>
+        <select id="proxyPick"><option value="">（直连 · 不使用代理）</option></select>
+        <span class="hint">保存后该账号的全部出站请求（对话 / 余额 / 签到 / 事件上报）都经所选代理；选「直连」即单独清除。</span>
+      </label>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button id="btnProxySave" class="primary">保存</button>
+      <button id="btnProxyClose">关闭</button>
     </footer>
   </div>
 </div>
@@ -914,7 +1139,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <!-- 密钥 -->
 <div class="veil" id="keyVeil" data-lock="1">
-  <div class="dlg" style="width:420px">
+  <div class="dlg" style="width:min(420px, 100%)">
     <header>
       <h3>需要访问密钥</h3>
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>

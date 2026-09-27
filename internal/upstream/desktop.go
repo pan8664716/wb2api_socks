@@ -112,6 +112,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if err != nil {
 		return err
 	}
+	c.bindProxy(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
@@ -213,6 +214,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if err != nil {
 		return err
 	}
+	c.bindProxy(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
@@ -280,6 +282,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
+	c.bindProxy(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -391,6 +394,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if err != nil {
 		return nil, err
 	}
+	c.bindProxy(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", desktopUA)
@@ -438,6 +442,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 		return "", "", err
 	}
 	h := req.Header
+	c.bindProxy(req, a)
 	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")

@@ -71,9 +71,16 @@ func newDialer() *net.Dialer {
 //     完成后无 h2 协议可用，连接退回 HTTP/1.1）。
 //   - TCP 层：DialContext 10s 建连上限 + 15s keepalive 探测，半开连接在建立期
 //     和复用期都能被快速识别（见 dialTimeout/dialKeepAlive 注释）。
-func newTransport() *http.Transport {
+func newTransport() *http.Transport { return newTransportWithTLS(false) }
+
+// newTransportWithTLS 同 newTransport，但可关闭 TLS 证书校验（skipVerify=true）。
+//
+// 用途：部分 socks5 代理会 MITM 掉 443（自带过期/自签证书），经它的请求会直接死在
+// x509 校验上。此时由 proxyTLSRouter 把「被标记免校验」的请求切到这条 Transport 上，
+// 而不是全局关校验——直连与其它代理仍走严格校验。
+func newTransportWithTLS(skipVerify bool) *http.Transport {
 	dialer := newDialer()
-	return &http.Transport{
+	tr := &http.Transport{
 		DialContext: dialer.DialContext,
 		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——
 		// nil 表示「让标准库注入默认 h2 映射」（kongjianguan 实测：设
@@ -85,6 +92,11 @@ func newTransport() *http.Transport {
 		IdleConnTimeout:       idleConnTimeout,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
+	if skipVerify {
+		// 仅用于「明确标记免校验」的代理链路（见 newTransportWithTLS 注释）。
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // 显式开关，非默认行为
+	}
+	return tr
 }
 
 // closeIdler 实现该接口的 RoundTripper 支持清空空闲连接池（*http.Transport、

@@ -21,6 +21,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/proxypool"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -667,16 +668,116 @@ type Client struct {
 	// false 时即便用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
+
+	// ProxyFor 按账号 uid 返回出站代理地址（socks5://[user:pass@]host:port）。
+	// nil 或返回空串 = 该账号直连（现状零回归）。生产由 main 接 proxypool.Pool.ProxyFor：
+	// 账号池里给某个账号单独指定了代理，它的一切出站（chat / billing / refresh / 事件上报）
+	// 都走该代理；未指定则直连。
+	//
+	// 挂载方式见 bindProxy：请求构造期（请求头注入点）把代理写进 request context，
+	// Transport.Proxy 再按 context 取值——每个请求独立选路，连接池按代理隔离。
+	ProxyFor func(uid string) string
+
+	// ProxySkipVerifyFor 报告该账号的代理是否「免 TLS 证书校验」（代理池里的 skip_verify
+	// 标记）。nil 或 false = 走严格校验。只影响经该代理的请求（见 proxyTLSRouter）。
+	ProxySkipVerifyFor func(uid string) bool
+
+	// transport 出站 Transport 分发器（New 构造；测试注入自定义 HTTP/ChatHTTP 时为 nil）。
+	// 供 SetTLSSkipVerify / SetHeaderTimeout 在装配期或面板保存时统一改写两条 Transport。
+	transport *proxyTLSRouter
+}
+
+// proxyCtxKey 出站请求 context 中承载代理地址的键（仅本包使用）。
+type proxyCtxKey struct{}
+
+// bindProxy 把账号当前生效的代理写进请求 context（无代理时不动）。
+//
+// 为什么走 context 而不是直接换 http.Client：出站 client/Transport 是**共享单例**
+// （HTTP 与 ChatHTTP 复用同一个 *http.Transport，连接池不重复），而代理是**每账号**
+// 的。Transport.Proxy 回调拿得到 *http.Request，于是把「本请求该走哪个代理」随请求
+// 传递是最小侵入的做法：不动 client 结构、不动连接池共享关系、并发账号各走各的代理
+// （http.Transport 内部按 proxyURL 分桶缓存连接，不会串号）。
+//
+// 调用点 = 请求头注入点（CommonHeaders / BillingHeaders / 少数自建头的上报路径），
+// 那里是「每个出站请求必经、且手里有 *auth.Auth」的天然收敛点。
+func (c *Client) bindProxy(req *http.Request, a *auth.Auth) {
+	if c == nil || req == nil || a == nil || c.ProxyFor == nil {
+		return
+	}
+	addr := c.ProxyFor(a.UID)
+	if addr == "" {
+		return
+	}
+	ctx := context.WithValue(req.Context(), proxyCtxKey{}, addr)
+	// 该代理被标记「免 TLS 校验」（MITM 型代理）→ 本请求也标记，router 切到 insecure
+	// Transport；其它账号不受影响。
+	if c.ProxySkipVerifyFor != nil && c.ProxySkipVerifyFor(a.UID) {
+		ctx = context.WithValue(ctx, tlsSkipCtxKey{}, true)
+	}
+	*req = *req.WithContext(ctx)
+}
+
+// SetTLSSkipVerify 设置「全局免 TLS 证书校验」（config upstream.tls_skip_verify）。
+// 热生效：只翻转 router 上的 atomic 开关，已在途请求不受影响，新请求按新值选 Transport。
+//
+// 默认 false（严格校验）。打开即所有出站都不校验证书——只在「代理链路整体不可信」
+// 的场景用；单条代理有问题请改用代理池的 skip_verify 标记（粒度更细）。
+func (c *Client) SetTLSSkipVerify(v bool) {
+	if c == nil || c.transport == nil {
+		return
+	}
+	c.transport.skipAll.Store(v)
+}
+
+// TLSSkipVerify 报告全局免校验开关当前状态（运维观测）。
+func (c *Client) TLSSkipVerify() bool {
+	return c != nil && c.transport != nil && c.transport.skipAll.Load()
+}
+
+// SetHeaderTimeout 设置聊天 SSE 首字节（响应头）超时，并同步到两条出站 Transport。
+// 替代调用方对 *http.Transport 的类型断言（Transport 现为分发器包装，不再是裸 *http.Transport）。
+func (c *Client) SetHeaderTimeout(d time.Duration) {
+	if c == nil {
+		return
+	}
+	c.HeaderTimeout = d
+	if c.transport == nil {
+		return
+	}
+	c.transport.secure.ResponseHeaderTimeout = d
+	c.transport.insecure.ResponseHeaderTimeout = d
+}
+
+// proxyForRequest http.Transport.Proxy 回调：按请求 context 里的代理地址选路。
+// 解析失败或未绑定 → 直连（nil, nil）。绑定后即使代理不可用也**不回落直连**——
+// 运维给账号指定了代理就应当走代理，失败要让日志/面板看见，静默直连会掩盖配置问题。
+func (c *Client) proxyForRequest(req *http.Request) (*url.URL, error) {
+	if req == nil {
+		return nil, nil
+	}
+	addr, _ := req.Context().Value(proxyCtxKey{}).(string)
+	if addr == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(addr)
+	if err != nil || u.Host == "" {
+		log.Printf("WARN: [upstream] 代理地址解析失败，本次直连: %s", proxypool.MaskProxy(addr))
+		return nil, nil
+	}
+	return u, nil
 }
 
 // New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：真正禁 h2 /
 // TLS 握手超时 / 短 keepalive 探测 / 失败清池，参数见 transport.go——吸收上游
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
-	tr := newTransport()
-	return &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+	// 两条 Transport 参数一致（超时/连接池/禁 h2 全同），唯一差别是 TLS 证书校验；
+	// 由 router 按请求分发（见 router.go）。
+	router := &proxyTLSRouter{secure: newTransportWithTLS(false), insecure: newTransportWithTLS(true)}
+	c := &Client{
+		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: router},
+		ChatHTTP:             &http.Client{Timeout: 0, Transport: router}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		transport:            router,
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
@@ -685,6 +786,12 @@ func New() *Client {
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
 	}
+	// 代理选路挂在两条 Transport 上（HTTP/ChatHTTP 同一实例）：按请求 context 里的
+	// 账号代理地址选路，未绑定的请求走 ProxyFor 返回 nil → 直连（零回归）。
+	// 测试注入的自定义 Transport 不受影响（本字段只在 New 构造的实例上设置）。
+	router.secure.Proxy = c.proxyForRequest
+	router.insecure.Proxy = c.proxyForRequest
+	return c
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -1581,6 +1688,8 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// 代理选路：该端点自建头（未走 Common/Billing），单独绑定保证全出站覆盖。
+	c.bindProxy(req, a)
 	// AccessToken 加锁快照（同 fetchEnterpriseModels）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	if a != nil && a.UID != "" {

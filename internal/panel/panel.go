@@ -24,6 +24,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/proxypool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -56,6 +57,11 @@ type Config struct {
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
+
+	// Proxies 代理池（socks5 列表 + 账号分配）。nil = 代理池相关接口返回 501
+	// （嵌入式/测试装配未注入时不 panic）。生产由 main 注入，同一实例也接到
+	// upstream.Client.ProxyFor 上，面板改动即时对出站生效。
+	Proxies *proxypool.Pool
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -176,6 +182,15 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
+	p.mux.HandleFunc("GET /panel/api/proxies", p.withAuth(p.proxiesList))
+	p.mux.HandleFunc("POST /panel/api/proxies/add", p.withAuth(p.proxiesAdd))
+	p.mux.HandleFunc("POST /panel/api/proxies/remove", p.withAuth(p.proxiesRemove))
+	p.mux.HandleFunc("POST /panel/api/proxies/clear", p.withAuth(p.proxiesClear))
+	p.mux.HandleFunc("POST /panel/api/proxies/assign", p.withAuth(p.proxiesAssign))
+	p.mux.HandleFunc("POST /panel/api/proxies/unassign", p.withAuth(p.proxiesUnassign))
+	p.mux.HandleFunc("POST /panel/api/proxies/skipverify", p.withAuth(p.proxiesSkipVerify))
+	p.mux.HandleFunc("POST /panel/api/proxies/bulk", p.withAuth(p.proxiesBulk))
+	p.mux.HandleFunc("POST /panel/api/proxies/check", p.withAuth(p.proxiesCheck))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
@@ -230,8 +245,41 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		"proxy_total":     p.proxyCount(),
+		"accounts":        p.accountsWithProxy(),
 	})
+}
+
+// proxyCount 代理池条数（未启用时为 0）。
+func (p *Panel) proxyCount() int {
+	if p.cfg.Proxies == nil {
+		return 0
+	}
+	return p.cfg.Proxies.Count()
+}
+
+// accountStatusView 账号状态 + 当前生效代理（account 表格「代理」列的数据来源）。
+// 用内嵌而非改 pool.Status：代理归属面板侧能力，池包不应反向依赖代理池。
+type accountStatusView struct {
+	pool.Status
+	Proxy string `json:"proxy,omitempty"`
+}
+
+// accountsWithProxy 账号状态列表（池顺序，按 uid 排序）+ 每号当前代理地址。
+func (p *Panel) accountsWithProxy() []accountStatusView {
+	list := p.cfg.Pool.List()
+	out := make([]accountStatusView, 0, len(list))
+	if p.cfg.Proxies == nil {
+		for _, st := range list {
+			out = append(out, accountStatusView{Status: st})
+		}
+		return out
+	}
+	assign := p.cfg.Proxies.Assignment()
+	for _, st := range list {
+		out = append(out, accountStatusView{Status: st, Proxy: assign[st.UID]})
+	}
+	return out
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
@@ -465,6 +513,12 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
+	}
+	// 账号出池 → 连带清掉它的代理分配（不留指向不存在账号的脏分配）。
+	if p.cfg.Proxies != nil {
+		if _, err := p.cfg.Proxies.Unassign(uid); err != nil {
+			log.Printf("panel: 移除账号时清除代理分配失败 uid=%s: %v", uid, err)
+		}
 	}
 	fileMsg := ""
 	if a.FilePath != "" {

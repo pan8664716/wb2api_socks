@@ -21,6 +21,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/proxypool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
@@ -132,9 +133,12 @@ func main() {
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
-	up.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
-	if tr, ok := up.ChatHTTP.Transport.(*http.Transport); ok {
-		tr.ResponseHeaderTimeout = up.HeaderTimeout
+	// 经 SetHeaderTimeout 统一改写两条出站 Transport（HTTP/ChatHTTP 共享的分发器内部）。
+	up.SetHeaderTimeout(time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second)
+	// 全局免 TLS 证书校验（config upstream.tls_skip_verify；更细的粒度见代理池 skip_verify）。
+	up.SetTLSSkipVerify(cfg.Upstream.TLSSkipVerify)
+	if up.TLSSkipVerify() {
+		log.Printf("upstream: 已全局关闭 TLS 证书校验（upstream.tls_skip_verify=true）——仅建议在代理链路不可信时使用")
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
@@ -159,6 +163,24 @@ func main() {
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
+
+	// 代理池（socks5）：与 state.json / usage.json 同目录同风格的独立文件，
+	// 数据目录随 state_file 配置一起搬移，不新增配置项。
+	//
+	// 接线方式：proxies.ProxyFor 直接挂到 up.ProxyFor —— 每个出站请求按「账号 uid →
+	// 代理地址」查表选路（未指定代理的账号直连，与本功能上线前行为完全一致）。
+	// 面板改动（新增/分配/清除）即时生效：查表发生在请求构造期，无需重启。
+	proxies := proxypool.New(stateSibling(cfg.StateFile, "proxies.json"))
+	if err := proxies.Load(); err != nil {
+		log.Printf("proxy pool: 载入 %s 失败（按空池启动）: %v", proxies.Path(), err)
+	}
+	up.ProxyFor = proxies.ProxyFor
+	// 代理带 skip_verify 标记时，只让经它的请求免 TLS 校验（MITM 型代理，见 proxypool.Proxy）。
+	up.ProxySkipVerifyFor = proxies.SkipVerifyFor
+	if n := proxies.Count(); n > 0 {
+		log.Printf("proxy pool: 已加载 %d 条 socks5 代理，%d 个账号已指定代理（%s）",
+			n, len(proxies.Assignment()), proxies.Path())
+	}
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
@@ -232,6 +254,7 @@ func main() {
 
 	pn := panel.New(panel.Config{
 		Pool:        p,
+		Proxies:     proxies,
 		Usage:       rec,
 		Upstream:    up,
 		Scheduler:   sch,
@@ -398,6 +421,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 	})
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
+	up.SetTLSSkipVerify(newCfg.Upstream.TLSSkipVerify) // 热生效（router 上的 atomic 开关）
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

@@ -46,6 +46,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
+| 🧩 **Codex / Responses 兼容** | 除 `/v1/chat/completions` 外内置 **`/v1/responses`** 适配层（Responses ↔ Chat Completions 双向翻译，含流式事件序列与工具调用），Codex 0.155+（`wire_api` 只认 `responses`）可直接接入；面板「接入」页给出现成配置片段 |
+| 🌐 **代理池（socks5）** | 批量维护 socks5 代理（每行一条，自动去重/备注/连通性探测）；账号池里可为**每个账号单独指定代理**，或一键配置（按 IP 顺序 / 同一个 IP / 一键清除）；未指定的账号直连，改动即时生效 |
+| 🔓 **TLS 免校验（两档）** | 代理会 MITM 掉 443（报 `x509: certificate has expired / self-signed`）时：① 单条代理点「免校验」（`\|insecure`），只让经它的请求跳过证书校验；② 配置 `upstream.tls_skip_verify` 全局关闭。两者都热生效 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题），账号运维 / 模型档位查询 / 在线改配置（热生效）/ 运行日志 / 积分任务，见 [Web 管理面板](#-web-管理面板) |
 
@@ -140,6 +143,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
+| **代理池（socks5）** | `internal/proxypool` + 面板「代理池」视图：批量增删 socks5 代理、每账号单独指定 / 一键按 IP 顺序分配 / 同一个 IP / 一键清除、连通性探测。出站按账号选路（chat / billing / refresh / 上报全覆盖），未指定的账号直连，改动即时生效（无需重启） |
+| **Responses API 适配（Codex 接入）** | `POST /v1/responses`：Responses ↔ Chat Completions 双向翻译（含流式事件序列、工具调用、usage 口径），复用既有轮转主链路；实测 Codex 0.155 文本与 shell 工具调用全链路通过；面板新增「接入」页给出配置片段与模型列表 |
+| **TLS 免校验（两档）** | 代理 MITM 导致 `x509: certificate has expired / self-signed` 时：单条代理级「免校验」（`internal/upstream/router.go` 双 Transport 分发，只影响经该代理的请求）或全局 `upstream.tls_skip_verify`（热生效） |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 
@@ -356,6 +362,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `upstream.tls_skip_verify` | `false` | **全局**关闭出站 TLS 证书校验（代理 MITM 导致 `x509: certificate has expired / self-signed` 时用）。热生效；更细的粒度见代理池单条代理的「免校验」 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
@@ -524,13 +531,15 @@ http://127.0.0.1:7863/panel/
 ```
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航分四个视图：
+界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航分若干视图：
 
 | 视图 | 功能 |
 |---|---|
 | **账号池** | 统计条（总数/可用/冷却/禁用/可用积分合计/粘性会话）+ 账号表：状态标签（可用/限流冷却/积分冷却/熔断/已禁用）、积分量条、成功失败计数、在途、单号操作（签到/余额/任务/解冻/禁用/移除）；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」 |
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
+| **代理池** | 批量添加 socks5 代理（一行一条，支持备注与去重）、代理表（连通性探测 / 删除 / 已分配账号）、一键配置（按 IP 顺序 / 同一个 IP / 一键清除）、账号 → 代理对照表；账号池表格每行也有「代理」按钮可单独指定/清除 |
+| **接入** | 客户端怎么连本网关：Base URL / API Key（按当前访问地址自动推导）、Codex `config.toml` 片段、curl / Python 示例、可用模型列表（点模型名即复制并回填片段），全部一键复制 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
 | **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
 | **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动） |
@@ -551,11 +560,131 @@ http://127.0.0.1:7863/panel/
 
 > ⚠️ 公网部署提示：服务自身只提供明文 HTTP，**请务必置于 HTTPS 反向代理之后**（Nginx/Caddy 等）并配置访问限流；仅本机或私有网络使用时可直接运行。
 
+## 🧩 接入 Codex（与其它客户端）
+
+### 直接可用的配置（Codex）
+
+Codex 的 `model_providers.<id>.wire_api` **只接受 `responses`**（官方配置参考原文：*"`responses` is the only supported value"*；实测旧值 `chat` 会让 Codex 直接拒绝加载配置：*"`wire_api = "chat"` is no longer supported"*）。本网关已内置 `/v1/responses` 适配层，因此 Codex 可直接接入：
+
+```toml
+# ~/.codex/config.toml
+model = "cn:glm-5.2"          # 或 global:xxx（模型名必须带域前缀，见 /v1/models）
+model_provider = "wb2api"
+model_context_window = 200000
+
+[model_providers.wb2api]
+name = "WorkBuddy2API"
+base_url = "http://127.0.0.1:7863/v1"   # 换成你的监听地址（局域网用本机 IP）
+env_key = "WB2API_KEY"
+wire_api = "responses"
+```
+
+```bash
+export WB2API_KEY=<config.json 里的 api_key>
+codex exec "只回答两个字：你好"     # 自检
+```
+
+保存后 `codex` 即走本网关。面板「**接入**」页会把上面这些按你当前访问的地址生成好，一键复制。
+
+> 注：`model_max_output_tokens` 在当前 Codex 版本不被识别（会提示 ignored）；上下文用 `model_context_window` 声明即可，其余模型元数据可忽略（Codex 会回落到默认元数据，仅有一条提示）。
+
+### 适配层做了什么
+
+`internal/server/responses.go` 把 Responses 请求翻译成 Chat Completions 请求，交给既有 `chatCompletions` 主链路（选号 / 轮转 / 冷却 / 粘性 / SSE 重建 / 用量记录全部复用，不改动那条被真实流量打磨过的路径），再把结果翻译回去：
+
+| 方向 | 映射 |
+|---|---|
+| 请求 | `instructions` → system 消息；`input` 数组项（`message` / `function_call` / `function_call_output`）→ `messages`（连续 `function_call` 合并为一条 assistant 的 `tool_calls`；`function_call_output` → `role=tool`）；扁平工具 `{type:"function",name,...}` → 嵌套 `{type:"function",function:{...}}`；`reasoning.effort` → `reasoning_effort`；`max_output_tokens` → `max_tokens` |
+| 响应 | `output` 项：文本 → `message` + `output_text`；工具调用 → `function_call`（`call_id` / `name` / `arguments` 原样透传）；`usage`：`prompt_tokens`/`completion_tokens` → `input_tokens`/`output_tokens`（含 `*_tokens_details`） |
+| 流式 | `response.created` / `response.in_progress` / `output_item.added` / `content_part.added` / `output_text.delta`* / `output_text.done` / `content_part.done` / `output_item.done` / `function_call_arguments.delta`* / `function_call_arguments.done` / `response.completed`，`sequence_number` 严格递增 |
+| 错误 | 上游失败（非 2xx）→ 原状态码 + OpenAI 错误信封原样透出（客户端按 HTTP 错误处理与重试）；流中错误帧 → `response.failed` |
+
+### 其它客户端
+
+任何 OpenAI 兼容客户端（OpenAI SDK / Cherry Studio / ChatBox / Cline 等）把 Base URL 指向 `http://<host>:<port>/v1`、API Key 填 `api_key`、模型名带 `cn:` / `global:` 前缀即可；这类客户端走的是 `/v1/chat/completions`，不需要 Responses 适配层。
+
+## 🌐 代理池（socks5）
+
+给**单个账号**指定出站代理，用于多账号场景下的 IP 隔离（避免多个账号共用宿主 IP 被上游关联）。
+入口：面板左侧「代理池」视图，或账号池表格每行的「代理」按钮。
+
+### 数据与生效方式
+
+- 代理与分配关系落盘在 `data/proxies.json`（与 `state.json` / `usage.json` 同目录，随 `state_file` 配置一起搬移；文件权限 `0600`，内含代理口令）；
+- 选路在**请求构造期**按「账号 uid → 代理地址」查表（`upstream.Client.ProxyFor` → `http.Transport.Proxy`），
+  同一个共享 Transport 按代理分桶复用连接，**并发账号各走各的代理不会串号**；
+- **未指定代理的账号直连**（与本功能上线前行为完全一致）；指定后该账号的**全部出站**（对话 / 余额 / 签到 / 保活 / 旅行 / 事件上报 / token 刷新 / 模型探测）都经该代理；
+- 面板保存即生效：下一个出站请求就走新代理，**无需重启**；
+- 代理不可用时请求会**失败并记录错误**（不静默回落直连）——静默直连会掩盖配置问题（运维以为在走代理，实际暴露了本机 IP）。
+
+### 批量添加支持的写法
+
+每行一条，空行与 `#` / `//` 开头的行为注释；规范化后自动去重：
+
+```
+socks5://user:pass@1.2.3.4:1080      # 标准 URL
+socks5h://1.2.3.4:1080               # socks5h / socks 等价接受
+1.2.3.4:1080                         # 无认证
+user:pass@1.2.3.4:1080               # 无 scheme
+1.2.3.4:1080:user:pass               # 代理商常见的四段式
+2.2.2.2:1080|香港01                   # 竖线后接备注（口令含竖线请写 %7C）
+```
+
+仅支持 socks5 族；`http://` / `socks4://` 等会明确报错并原样回显该行，便于定位。
+
+### 代理证书报错（x509）怎么办
+
+部分（尤其免费）socks5 代理会 **MITM 掉 443**：它用自己的证书终结 TLS，于是请求死在证书校验上：
+
+```
+Post "https://www.workbuddy.ai/billing/meter/get-user-resource":
+  tls: failed to verify certificate: x509: certificate has expired or is not yet valid: ...
+```
+
+两档处理（都不影响其它账号）：
+
+| 粒度 | 操作 | 生效范围 |
+|---|---|---|
+| **单条代理**（推荐） | 面板「代理池」表格点该代理的 **「免校验」**；或添加时在行尾写 `\|insecure`（如 `host:port\|香港01\|insecure`） | 只有**经该代理**的请求跳过证书校验；直连与其它代理仍严格校验 |
+| **全局** | 配置页勾「出站跳过 TLS 证书校验」，或写 `"upstream": {"tls_skip_verify": true}` | 所有出站都不校验证书（热生效，无需重启） |
+
+表格里被标记的代理会显示 `免校验` 标签，可随时点「恢复校验」退回严格模式。
+
+### 一键配置与清除
+
+| 操作 | 行为 |
+|---|---|
+| **按 IP 顺序配置** | 账号池顺序 × 代理池顺序一对一：第 1 个账号用第 1 个 IP、第 2 个账号用第 2 个 IP…代理用尽则从头循环（账号多于代理时复用） |
+| **同一个 IP** | 选定一个代理分配给全部（或仅未分配的）账号 |
+| **一键清除** | 清除全部账号的分配（**代理列表保留**），账号恢复直连 |
+| **单独指定 / 单独清除** | 账号池表格「代理」按钮，或「代理池 → 账号 → 代理」表的「指定 / 清除」 |
+| **连通性探测** | 单个「测试」或「全部测试连通性」：SOCKS5 握手 + CONNECT（目标端口 443 时追加 TLS 握手）到上游 chat 域，结果（可用 / 延迟 / 错误文案）写回代理记录并持久化 |
+
+「仅未分配的账号」选项用于**保留人工单独指定的结果**（批量补齐剩余账号）。
+
+### 面板接口
+
+| 端点 | 说明 |
+|---|---|
+| `GET /panel/api/proxies` | 代理列表（含探测结论与已分配账号）+ 账号 → 代理对照；顺带清理已移除账号的残留分配 |
+| `POST /panel/api/proxies/add` | 批量添加（`{"text":"多行"}` 或 `{"lines":[...]}`） |
+| `POST /panel/api/proxies/remove` | 删除单个代理（连带解绑指向它的账号） |
+| `POST /panel/api/proxies/clear` | 清空代理池（代理 + 全部分配） |
+| `POST /panel/api/proxies/assign` | 单账号指定（`addr` 为空 = 单独清除） |
+| `POST /panel/api/proxies/unassign` | 单账号单独清除 |
+| `POST /panel/api/proxies/skipverify` | 切换某代理的「免校验」标记（`{"addr":"...","skip":true}`，缺省 true） |
+| `POST /panel/api/proxies/bulk` | 一键配置（`mode`: `order` / `same` / `clear`，可选 `only_unassigned`、`uids`） |
+| `POST /panel/api/proxies/check` | 连通性探测（缺省全池；可指定 `addrs` / `target`） |
+
+> 注：global 账号的注册激活链路（`/billing/area/get-country-code` 等）同样按账号走代理；
+> models.dev 模型目录拉取是无账号归属的公共请求，始终直连。
+
 ## 🔌 API 端点
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | **Responses API 适配层**（Codex 等只支持 `wire_api="responses"` 的客户端）：请求/响应双向翻译后复用 chat 主链路（选号 / 轮转 / 冷却 / 粘性 / 用量记录一致）；支持流式事件序列（`response.created` → `output_text.delta` / `function_call_arguments.delta` → `response.completed`）与非流式 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |

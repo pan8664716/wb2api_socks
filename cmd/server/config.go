@@ -100,6 +100,14 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// TLSSkipVerify 出站是否**全局**跳过 TLS 证书校验（默认 false = 严格校验）。
+		//
+		// 适用场景：上游链路被代理 MITM（代理自带过期/自签证书），报
+		// "x509: certificate has expired or is not yet valid"。打开即所有出站都不校验证书。
+		// 更细的粒度：只让某条代理免校验 → 代理池里给该代理加 skip_verify 标记
+		//（面板「代理池」表格有开关，或添加时写 `socks5://host:port|备注|insecure`）。
+		// 本字段热生效（面板保存即改，无需重启）。
+		TLSSkipVerify bool `json:"tls_skip_verify"`
 	} `json:"upstream"`
 
 	Features struct {

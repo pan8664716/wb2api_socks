@@ -238,6 +238,8 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	req.Header.Set("Origin", "https://www.workbuddy.cn")
 	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
 	req.Header.Set("x-client-platform", "web")
+	// 代理选路：Web 域领奖自建头（未走 BillingHeaders），单独绑定。
+	c.bindProxy(req, a)
 	if ua := c.userAgent(a); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}

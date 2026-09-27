@@ -163,6 +163,8 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
 	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
 	c.injectAccountStableHeaders(req, a)
+	// 代理选路：把该账号的代理写进请求 context（未指定 = 不动，走直连）。
+	c.bindProxy(req, a)
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -397,6 +399,8 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
 	c.injectDeviceToken(req, a)
+	// 代理选路：billing 域未走 CommonHeaders，单独绑定保证全出站覆盖。
+	c.bindProxy(req, a)
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
