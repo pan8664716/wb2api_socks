@@ -177,6 +177,28 @@ func main() {
 	up.ProxyFor = proxies.ProxyFor
 	// 代理带 skip_verify 标记时，只让经它的请求免 TLS 校验（MITM 型代理，见 proxypool.Proxy）。
 	up.ProxySkipVerifyFor = proxies.SkipVerifyFor
+	// 连续失败自动换代理：同一账号经同一代理连续失败达阈值（缺省 3）时，自动换一条
+	// 「该账号没用过的」代理并把原代理记为失效；池里无可用替代则解绑回直连。
+	up.OnProxyFailure = func(uid, addr string, err error) {
+		res, e := proxies.RecordProxyFailure(uid, addr, err.Error())
+		if e != nil {
+			log.Printf("proxy pool: 记录失败落盘出错 uid=%s addr=%s: %v", uid, proxypool.MaskProxy(addr), e)
+		}
+		switch {
+		case res.Switched:
+			log.Printf("proxy pool: 账号 %s 经 %s 连续失败 %d 次 → 自动切换代理 → %s",
+				uid, proxypool.MaskProxy(res.From), res.Count, proxypool.MaskProxy(res.To))
+		case res.Exhausted:
+			log.Printf("proxy pool: 账号 %s 经 %s 连续失败 %d 次，池中无可用替代 → 解绑回直连（原代理已记为失效）",
+				uid, proxypool.MaskProxy(res.From), res.Count)
+		}
+	}
+	// 传输层成功 → 清零该账号的连续失败计数（无变化时不落盘）。
+	up.OnProxySuccess = func(uid string) {
+		if e := proxies.RecordProxySuccess(uid); e != nil {
+			log.Printf("proxy pool: 清零失败计数落盘出错 uid=%s: %v", uid, e)
+		}
+	}
 	if n := proxies.Count(); n > 0 {
 		log.Printf("proxy pool: 已加载 %d 条 socks5 代理，%d 个账号已指定代理（%s）",
 			n, len(proxies.Assignment()), proxies.Path())

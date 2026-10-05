@@ -46,6 +46,14 @@ type Proxy struct {
 	OK        bool      `json:"ok"`
 	LastErr   string    `json:"last_err,omitempty"`
 	LatencyMs int64     `json:"latency_ms,omitempty"`
+	// Dead/DeadAt/DeadReason 失效标记：连续失败达阈值（见 RecordProxyFailure）时自动
+	// 打上，也可由面板人工标记。失效代理**保留在列表中**（可见、可一键清除、可复活），
+	// 但自动换代理的选号会跳过它们。
+	Dead       bool      `json:"dead,omitempty"`
+	DeadAt     time.Time `json:"dead_at,omitempty"`
+	DeadReason string    `json:"dead_reason,omitempty"`
+	// FailCount 累计失败次数（只增不清，观测用；连续失败计数在 failures 里按账号维护）。
+	FailCount int `json:"fail_count,omitempty"`
 }
 
 // Masked 返回脱敏地址（口令替换为 ***），用于日志展示。
@@ -68,7 +76,14 @@ func (p Proxy) Masked() string {
 type fileFormat struct {
 	Proxies     []Proxy           `json:"proxies"`
 	Assignments map[string]string `json:"assignments,omitempty"`
-	SavedAt     time.Time         `json:"saved_at,omitempty"`
+	// Failures 账号 uid → 连续失败状态（「连续失败 N 次自动换代理」的计数）。
+	Failures map[string]FailState `json:"failures,omitempty"`
+	// Used 账号 uid → 已经用过的代理地址（按时间顺序，去重）。自动换代理优先挑
+	// 「这个账号没用过的」代理，这就是那份"用过"清单。
+	Used map[string][]string `json:"used,omitempty"`
+	// FailThreshold 连续失败阈值（0/缺省 = DefaultFailThreshold）。
+	FailThreshold int       `json:"fail_threshold,omitempty"`
+	SavedAt       time.Time `json:"saved_at,omitempty"`
 }
 
 // Pool 代理池。零值不可用，必须经 New 构造。
@@ -82,6 +97,11 @@ type Pool struct {
 	index   map[string]int    // Addr → proxies 下标
 	assign  map[string]string // uid → Addr
 
+	// fails/used/threshold 见文件头「连续失败自动换代理」一节；均由 mu 保护。
+	fails     map[string]*FailState // uid → 连续失败状态
+	used      map[string][]string   // uid → 已用过的代理（有序去重）
+	threshold int                   // 连续失败阈值（>=1）
+
 	// saveMu 串行化「写临时文件 + rename」这一对操作。
 	//
 	// 为什么必须独占：并发 Save 会各自写**同一个** .tmp 路径（面板一次并发探测 N 条
@@ -94,9 +114,12 @@ type Pool struct {
 // New 构造代理池。path 为空 = 纯内存模式（不读写文件）。
 func New(path string) *Pool {
 	return &Pool{
-		path:   path,
-		index:  map[string]int{},
-		assign: map[string]string{},
+		path:      path,
+		index:     map[string]int{},
+		assign:    map[string]string{},
+		fails:     map[string]*FailState{},
+		used:      map[string][]string{},
+		threshold: DefaultFailThreshold,
 	}
 }
 
@@ -150,6 +173,40 @@ func (p *Pool) Load() error {
 		}
 		p.assign[uid] = norm
 	}
+	p.threshold = ff.FailThreshold
+	if p.threshold < 1 {
+		p.threshold = DefaultFailThreshold
+	}
+	p.fails = map[string]*FailState{}
+	for uid, fs := range ff.Failures {
+		if uid == "" || fs.Count <= 0 {
+			continue
+		}
+		if fs.Addr != "" {
+			if norm, err := NormalizeAddr(fs.Addr); err == nil {
+				fs.Addr = norm
+			} else {
+				fs.Addr = ""
+			}
+		}
+		cp := fs
+		p.fails[uid] = &cp
+	}
+	p.used = map[string][]string{}
+	for uid, addrs := range ff.Used {
+		if uid == "" {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, a := range addrs {
+			norm, err := NormalizeAddr(a)
+			if err != nil || seen[norm] {
+				continue
+			}
+			seen[norm] = true
+			p.used[uid] = append(p.used[uid], norm)
+		}
+	}
 	return nil
 }
 
@@ -166,12 +223,24 @@ func (p *Pool) Save() error {
 	defer p.saveMu.Unlock()
 	p.mu.RLock()
 	ff := fileFormat{
-		Proxies:     append([]Proxy(nil), p.proxies...),
-		Assignments: make(map[string]string, len(p.assign)),
-		SavedAt:     time.Now(),
+		Proxies:       append([]Proxy(nil), p.proxies...),
+		Assignments:   make(map[string]string, len(p.assign)),
+		Failures:      make(map[string]FailState, len(p.fails)),
+		Used:          make(map[string][]string, len(p.used)),
+		FailThreshold: p.threshold,
+		SavedAt:       time.Now(),
 	}
 	for uid, addr := range p.assign {
 		ff.Assignments[uid] = addr
+	}
+	for uid, fs := range p.fails {
+		if fs == nil {
+			continue
+		}
+		ff.Failures[uid] = *fs
+	}
+	for uid, addrs := range p.used {
+		ff.Used[uid] = append([]string(nil), addrs...)
 	}
 	p.mu.RUnlock()
 
@@ -299,6 +368,26 @@ func (p *Pool) Remove(addr string) (bool, []string, error) {
 			unbound = append(unbound, uid)
 		}
 	}
+	// 失败状态与被删代理相关时一并收尾：连续失败计数指向它 → 清掉（换到别的代理后
+	// 从零开始计数）；"用过清单"里去掉它（代理已不在池中，留着只会占位）。
+	for uid, fs := range p.fails {
+		if fs != nil && fs.Addr == norm {
+			delete(p.fails, uid)
+		}
+	}
+	for uid, addrs := range p.used {
+		kept := addrs[:0]
+		for _, a := range addrs {
+			if a != norm {
+				kept = append(kept, a)
+			}
+		}
+		if len(kept) == 0 {
+			delete(p.used, uid)
+		} else {
+			p.used[uid] = kept
+		}
+	}
 	p.mu.Unlock()
 	sort.Strings(unbound)
 	return true, unbound, p.Save()
@@ -311,6 +400,8 @@ func (p *Pool) Clear() (int, error) {
 	p.proxies = nil
 	p.index = map[string]int{}
 	p.assign = map[string]string{}
+	p.fails = map[string]*FailState{}
+	p.used = map[string][]string{}
 	p.mu.Unlock()
 	return n, p.Save()
 }
@@ -350,6 +441,7 @@ func (p *Pool) Assign(uid, addr string) error {
 		return fmt.Errorf("代理不在池中：%s", norm)
 	}
 	p.assign[uid] = norm
+	p.markUsedLocked(uid, norm)
 	p.mu.Unlock()
 	return p.Save()
 }
@@ -516,6 +608,7 @@ func (p *Pool) AssignBulk(uids []string, mode BulkMode, addr string, onlyUnassig
 		for i, uid := range targets {
 			px := p.proxies[i%len(p.proxies)].Addr
 			p.assign[uid] = px
+			p.markUsedLocked(uid, px)
 			res.Assigned[uid] = px
 		}
 	case BulkSame:
@@ -529,6 +622,7 @@ func (p *Pool) AssignBulk(uids []string, mode BulkMode, addr string, onlyUnassig
 		res.Assigned = map[string]string{}
 		for _, uid := range targets {
 			p.assign[uid] = norm
+			p.markUsedLocked(uid, norm)
 			res.Assigned[uid] = norm
 		}
 	default:

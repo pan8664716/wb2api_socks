@@ -527,6 +527,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="stats">
         <div class="stat"><div class="v" id="pxTotal">-</div><div class="k">代理总数</div></div>
         <div class="stat good"><div class="v" id="pxHealthy">-</div><div class="k">最近探测可用</div></div>
+        <div class="stat bad"><div class="v" id="pxDead">-</div><div class="k">失效代理</div></div>
         <div class="stat"><div class="v" id="pxAssigned">-</div><div class="k">已指定代理</div></div>
         <div class="stat"><div class="v" id="pxDirect">-</div><div class="k">直连账号</div></div>
         <div class="stat"><div class="v" id="pxAccts">-</div><div class="k">账号总数</div></div>
@@ -590,6 +591,44 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header>
+          <h3>失效与自愈</h3>
+          <span class="grow"></span>
+          <span class="note" id="pxHealthNote">同一账号经同一代理连续失败达阈值即自动换代理（优先没用过的），原代理记为失效</span>
+        </header>
+        <div class="pad">
+          <div class="grid3">
+            <label class="fld"><span class="lb">连续失败阈值（次）</span>
+              <input id="pxThreshold" type="number" min="1" max="1000" step="1" value="3">
+              <span class="hint">同一账号经同一代理连续失败达该次数 → 自动换一条「没用过的」代理；池中无可用替代则解绑回直连</span>
+            </label>
+            <label class="fld"><span class="lb">清除范围</span>
+              <select id="pxPurgeScope">
+                <option value="1">失效 + 最近探测不通（推荐）</option>
+                <option value="0">仅失效（连续失败自动标记 / 人工标记）</option>
+              </select>
+              <span class="hint">「过期代理」= 已判定不可用的那些，清除后账号自动解绑回直连</span>
+            </label>
+            <label class="fld"><span class="lb">免校验范围</span>
+              <select id="pxSkipScope">
+                <option value="0">全池代理</option>
+                <option value="1">仅失效代理</option>
+              </select>
+              <span class="hint">代理会 MITM 掉 443（x509 证书过期/自签）时一键开；只影响经这些代理的请求</span>
+            </label>
+          </div>
+          <div class="inline">
+            <button class="xs primary" id="btnPxSaveThreshold">保存阈值</button>
+            <button class="xs danger" id="btnPxPurge">一键清除过期代理</button>
+            <button class="xs" id="btnPxSkipAll">一键免校验</button>
+            <button class="xs" id="btnPxSkipOff">一键恢复校验</button>
+            <button class="xs" id="btnPxResetFail">清除失败记录</button>
+            <span class="note" id="pxHealthMsg"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
           <h3>代理列表</h3>
           <span class="grow"></span>
           <span class="note" id="pxNote">—</span>
@@ -599,7 +638,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <table class="acc px">
             <thead><tr>
               <th class="mark" aria-hidden="true"></th>
-              <th>代理地址</th><th>备注</th><th>最近探测</th><th>分配账号</th><th class="c-acts"></th>
+              <th>代理地址</th><th>备注</th><th>最近探测</th><th>失败 / 失效</th><th>分配账号</th><th class="c-acts"></th>
             </tr></thead>
             <tbody id="pxBody"></tbody>
           </table>
@@ -616,7 +655,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <table class="acc px">
             <thead><tr>
               <th class="mark" aria-hidden="true"></th>
-              <th>账号</th><th>代理</th><th class="c-acts"></th>
+              <th>账号</th><th>代理</th><th>连续失败</th><th class="c-acts"></th>
             </tr></thead>
             <tbody id="pxAccBody"></tbody>
           </table>

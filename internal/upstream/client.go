@@ -682,6 +682,17 @@ type Client struct {
 	// 标记）。nil 或 false = 走严格校验。只影响经该代理的请求（见 proxyTLSRouter）。
 	ProxySkipVerifyFor func(uid string) bool
 
+	// OnProxyFailure 出站请求**传输层失败**时的回调（经代理的请求才会触发；账号 +
+	// 实际使用的代理 + 错误）。生产接代理池的「连续失败自动换代理」：同一账号经同一
+	// 代理连续失败达阈值 → 自动换一条没用过的代理并把原代理记为失效。
+	// 注意：只有网络/握手级错误会回调；HTTP 4xx/5xx 与业务错误码不回调（那是上游
+	// 业务语义，不是代理的锅）。
+	OnProxyFailure func(uid, addr string, err error)
+
+	// OnProxySuccess 出站请求传输层成功时的回调（经代理的请求才会触发），用于清零
+	// 该账号的连续失败计数。热路径回调，实现必须是「无变化即返回」的廉价操作。
+	OnProxySuccess func(uid string)
+
 	// transport 出站 Transport 分发器（New 构造；测试注入自定义 HTTP/ChatHTTP 时为 nil）。
 	// 供 SetTLSSkipVerify / SetHeaderTimeout 在装配期或面板保存时统一改写两条 Transport。
 	transport *proxyTLSRouter
@@ -689,6 +700,9 @@ type Client struct {
 
 // proxyCtxKey 出站请求 context 中承载代理地址的键（仅本包使用）。
 type proxyCtxKey struct{}
+
+// proxyUIDCtxKey 出站请求 context 中承载账号 uid 的键（代理失败归因用）。
+type proxyUIDCtxKey struct{}
 
 // bindProxy 把账号当前生效的代理写进请求 context（无代理时不动）。
 //
@@ -709,12 +723,38 @@ func (c *Client) bindProxy(req *http.Request, a *auth.Auth) {
 		return
 	}
 	ctx := context.WithValue(req.Context(), proxyCtxKey{}, addr)
+	ctx = context.WithValue(ctx, proxyUIDCtxKey{}, a.UID)
 	// 该代理被标记「免 TLS 校验」（MITM 型代理）→ 本请求也标记，router 切到 insecure
 	// Transport；其它账号不受影响。
 	if c.ProxySkipVerifyFor != nil && c.ProxySkipVerifyFor(a.UID) {
 		ctx = context.WithValue(ctx, tlsSkipCtxKey{}, true)
 	}
 	*req = *req.WithContext(ctx)
+}
+
+// reportProxyResult router 的出站结果回调：把「哪个账号、经哪条代理、成功还是失败」
+// 转给 OnProxyFailure / OnProxySuccess（代理池据此做连续失败计数与自动换代理）。
+func (c *Client) reportProxyResult(req *http.Request, err error) {
+	if c == nil || req == nil {
+		return
+	}
+	addr := proxyAddrOf(req)
+	if addr == "" {
+		return
+	}
+	uid, _ := req.Context().Value(proxyUIDCtxKey{}).(string)
+	if uid == "" {
+		return
+	}
+	if err != nil {
+		if c.OnProxyFailure != nil {
+			c.OnProxyFailure(uid, addr, err)
+		}
+		return
+	}
+	if c.OnProxySuccess != nil {
+		c.OnProxySuccess(uid)
+	}
 }
 
 // SetTLSSkipVerify 设置「全局免 TLS 证书校验」（config upstream.tls_skip_verify）。
@@ -791,6 +831,8 @@ func New() *Client {
 	// 测试注入的自定义 Transport 不受影响（本字段只在 New 构造的实例上设置）。
 	router.secure.Proxy = c.proxyForRequest
 	router.insecure.Proxy = c.proxyForRequest
+	// 出站结果回调（代理失败归因 + 连续失败清零）：挂两条 Transport 共用的分发器上。
+	router.onResult = c.reportProxyResult
 	return c
 }
 
@@ -1125,10 +1167,16 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		if err != nil {
 			return nil, 0, nil, err
 		}
+		// 先把调用方 ctx 挂上（取消传播的根），再打请求头：ChatHeaders → CommonHeaders →
+		// bindProxy 是**基于 req.Context() 派生**的，会把账号代理 / 免校验标记叠加在这层
+		// 之上。顺序反了（先打头、后 WithContext(ctx)）会把代理标记整个覆盖掉——chat 是
+		// 主链路，那等于代理池对聊天请求完全不生效（实测：指定死代理后聊天仍成功直连）。
+		req = req.WithContext(ctx)
 		c.ChatHeaders(req, a, clientIP, meta)
-		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
-		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
-		reqCtx, cancel := context.WithCancel(ctx)
+		// 再从「已带代理标记 + 调用方取消」的 req.Context() 派生：既保留取消传播
+		// （父 ctx 取消 → 本 ctx 取消），又保住代理选路标记；monitorBody.Close 仍能
+		// 独立 cancel 本分支（空闲掐流）。
+		reqCtx, cancel := context.WithCancel(req.Context())
 		req = req.WithContext(reqCtx)
 		resp, err := c.chatHTTP().Do(req)
 		if err != nil {

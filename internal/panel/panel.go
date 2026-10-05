@@ -191,6 +191,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/proxies/skipverify", p.withAuth(p.proxiesSkipVerify))
 	p.mux.HandleFunc("POST /panel/api/proxies/bulk", p.withAuth(p.proxiesBulk))
 	p.mux.HandleFunc("POST /panel/api/proxies/check", p.withAuth(p.proxiesCheck))
+	p.mux.HandleFunc("POST /panel/api/proxies/purge", p.withAuth(p.proxiesPurge))
+	p.mux.HandleFunc("POST /panel/api/proxies/skipverify_all", p.withAuth(p.proxiesSkipAll))
+	p.mux.HandleFunc("POST /panel/api/proxies/dead", p.withAuth(p.proxiesDead))
+	p.mux.HandleFunc("POST /panel/api/proxies/reset_fail", p.withAuth(p.proxiesResetFail))
+	p.mux.HandleFunc("POST /panel/api/proxies/threshold", p.withAuth(p.proxiesThreshold))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }

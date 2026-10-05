@@ -69,6 +69,12 @@ func (p *Panel) proxiesList(w http.ResponseWriter, r *http.Request) {
 		// SkipVerify 该代理免 TLS 证书校验（MITM 型代理；见 proxypool.Proxy.SkipVerify）。
 		SkipVerify bool     `json:"skip_verify,omitempty"`
 		Accounts   []string `json:"accounts,omitempty"`
+		// Dead/DeadAt/DeadReason 失效记录（连续失败自动标记或人工标记）。
+		Dead       bool   `json:"dead,omitempty"`
+		DeadAt     string `json:"dead_at,omitempty"`
+		DeadReason string `json:"dead_reason,omitempty"`
+		// FailCount 累计失败次数（观测用）。
+		FailCount int `json:"fail_count,omitempty"`
 	}
 	out := make([]proxyView, 0, len(proxies))
 	for _, px := range proxies {
@@ -77,12 +83,16 @@ func (p *Panel) proxiesList(w http.ResponseWriter, r *http.Request) {
 		v := proxyView{
 			Addr: px.Addr, Label: px.Label, OK: px.OK, SkipVerify: px.SkipVerify,
 			LastErr: px.LastErr, LatencyMs: px.LatencyMs, Accounts: uids,
+			Dead: px.Dead, DeadReason: px.DeadReason, FailCount: px.FailCount,
 		}
 		if !px.AddedAt.IsZero() {
 			v.AddedAt = px.AddedAt.Format(time.RFC3339)
 		}
 		if !px.LastCheck.IsZero() {
 			v.LastCheck = px.LastCheck.Format(time.RFC3339)
+		}
+		if !px.DeadAt.IsZero() {
+			v.DeadAt = px.DeadAt.Format(time.RFC3339)
 		}
 		out = append(out, v)
 	}
@@ -95,6 +105,13 @@ func (p *Panel) proxiesList(w http.ResponseWriter, r *http.Request) {
 		Label    string `json:"label,omitempty"`
 		// SkipVerify 该账号当前代理是否免 TLS 校验（面板提示用）。
 		SkipVerify bool `json:"skip_verify,omitempty"`
+		// FailCount 该账号经当前代理的连续失败次数（达阈值会自动换代理）。
+		FailCount int `json:"fail_count,omitempty"`
+		// FailAddr/FailErr 计数对应的代理与最近错误（面板提示用）。
+		FailAddr string `json:"fail_addr,omitempty"`
+		FailErr  string `json:"fail_err,omitempty"`
+		// Used 该账号已用过的代理数（自动换代理的候选排除数）。
+		Used int `json:"used,omitempty"`
 	}
 	labelOf := map[string]string{}
 	skipOf := map[string]bool{}
@@ -105,19 +122,24 @@ func (p *Panel) proxiesList(w http.ResponseWriter, r *http.Request) {
 	accs := make([]acctView, 0, len(accounts))
 	for _, st := range accounts {
 		addr := assign[st.UID]
+		fs := pp.FailureStateOf(st.UID)
 		accs = append(accs, acctView{
 			UID: st.UID, Nickname: st.Nickname, Realm: st.Realm,
 			Proxy: addr, Label: labelOf[addr], SkipVerify: skipOf[addr],
+			FailCount: fs.Count, FailAddr: fs.Addr, FailErr: fs.LastErr,
+			Used: len(pp.UsedAddrs(st.UID)),
 		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"path":     pp.Path(),
-		"proxies":  out,
-		"accounts": accs,
-		"total":    len(proxies),
-		"assigned": len(assign),
+		"ok":        true,
+		"path":      pp.Path(),
+		"proxies":   out,
+		"accounts":  accs,
+		"total":     len(proxies),
+		"assigned":  len(assign),
+		"dead":      pp.DeadCount(),
+		"threshold": pp.FailThreshold(),
 	})
 }
 
@@ -435,6 +457,160 @@ func (p *Panel) proxiesCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "target": target, "healthy": okCount, "results": results,
 	})
+}
+
+// proxiesPurge 一键清除「过期 / 失效」代理。
+//
+//	POST /panel/api/proxies/purge   {"include_failed_check": true}
+//
+// 清除对象 = 失效标记的代理（Dead，连续失败自动标记或人工标记）；include_failed_check
+// 为 true 时**额外**清除「最近探测不通」的代理（探活已失败、但还没触发自动换代理的）。
+// 被清代理的账号分配一并解绑（回直连），相关失败记录与"用过清单"同步清理。
+func (p *Panel) proxiesPurge(w http.ResponseWriter, r *http.Request) {
+	pp := p.cfg.Proxies
+	if pp == nil {
+		writeErr(w, http.StatusNotImplemented, "代理池未启用")
+		return
+	}
+	var body struct {
+		IncludeFailedCheck *bool `json:"include_failed_check"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body)
+	}
+	includeFailed := true // 缺省口径：失效 + 探测不通，都是运维眼里的「过期代理」
+	if body.IncludeFailedCheck != nil {
+		includeFailed = *body.IncludeFailedCheck
+	}
+	res, err := pp.PurgeDead(includeFailed)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "落盘失败: "+err.Error())
+		return
+	}
+	log.Printf("panel: 代理池一键清除过期代理 移除=%d 解绑=%d 剩余=%d（含探测不通=%v）",
+		len(res.Removed), res.Unbound, res.Kept, includeFailed)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"removed": len(res.Removed),
+		"addrs":   res.Removed,
+		"unbound": res.Unbound,
+		"kept":    res.Kept,
+	})
+}
+
+// proxiesSkipAll 一键免校验：批量打开（或关闭）代理的「免 TLS 证书校验」标记。
+//
+//	POST /panel/api/proxies/skipverify_all   {"skip": true, "only_dead": false, "addrs": []}
+//
+// 典型用法：整池代理都会 MITM 掉 443（证书报错）→ 一键全开；只想给探测不通的那几条
+// 开 → only_dead=true。
+func (p *Panel) proxiesSkipAll(w http.ResponseWriter, r *http.Request) {
+	pp := p.cfg.Proxies
+	if pp == nil {
+		writeErr(w, http.StatusNotImplemented, "代理池未启用")
+		return
+	}
+	var body struct {
+		Skip     *bool    `json:"skip"`
+		OnlyDead bool     `json:"only_dead"`
+		Addrs    []string `json:"addrs"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body)
+	}
+	skip := true
+	if body.Skip != nil {
+		skip = *body.Skip
+	}
+	n, err := pp.SetAllSkipVerify(skip, body.OnlyDead, body.Addrs)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	log.Printf("panel: 代理池一键免校验 skip=%v only_dead=%v 变更=%d 条", skip, body.OnlyDead, n)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "changed": n, "skip_verify": skip})
+}
+
+// proxiesDead 人工标记 / 取消单个代理的「失效」状态。
+//
+//	POST /panel/api/proxies/dead   {"addr": "socks5://...", "dead": true, "reason": "人工"}
+func (p *Panel) proxiesDead(w http.ResponseWriter, r *http.Request) {
+	pp := p.cfg.Proxies
+	if pp == nil {
+		writeErr(w, http.StatusNotImplemented, "代理池未启用")
+		return
+	}
+	var body struct {
+		Addr   string `json:"addr"`
+		Dead   *bool  `json:"dead"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "解析请求体失败: "+err.Error())
+		return
+	}
+	dead := true
+	if body.Dead != nil {
+		dead = *body.Dead
+	}
+	reason := body.Reason
+	if reason == "" {
+		reason = "人工标记"
+	}
+	if err := pp.MarkDead(body.Addr, dead, reason); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	log.Printf("panel: 代理 %s 失效标记=%v（%s）", proxypool.MaskProxy(body.Addr), dead, reason)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "addr": body.Addr, "dead": dead})
+}
+
+// proxiesResetFail 清除连续失败记录（uid 为空 = 全部账号）。
+//
+//	POST /panel/api/proxies/reset_fail   {"uid": "..."}
+func (p *Panel) proxiesResetFail(w http.ResponseWriter, r *http.Request) {
+	pp := p.cfg.Proxies
+	if pp == nil {
+		writeErr(w, http.StatusNotImplemented, "代理池未启用")
+		return
+	}
+	var body struct {
+		UID string `json:"uid"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body)
+	}
+	n, err := pp.ResetFailures(body.UID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "落盘失败: "+err.Error())
+		return
+	}
+	log.Printf("panel: 代理池清除失败记录 uid=%q 条数=%d", body.UID, n)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": n})
+}
+
+// proxiesThreshold 设置「连续失败 N 次自动换代理」的阈值。
+//
+//	POST /panel/api/proxies/threshold   {"n": 3}
+func (p *Panel) proxiesThreshold(w http.ResponseWriter, r *http.Request) {
+	pp := p.cfg.Proxies
+	if pp == nil {
+		writeErr(w, http.StatusNotImplemented, "代理池未启用")
+		return
+	}
+	var body struct {
+		N int `json:"n"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "解析请求体失败: "+err.Error())
+		return
+	}
+	if err := pp.SetFailThreshold(body.N); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	log.Printf("panel: 代理池连续失败阈值设为 %d", pp.FailThreshold())
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "threshold": pp.FailThreshold()})
 }
 
 // splitLines 按行切分（兼容 \r\n）。

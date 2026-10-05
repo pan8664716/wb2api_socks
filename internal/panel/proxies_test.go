@@ -193,6 +193,11 @@ func TestProxiesAPIRequiresAuth(t *testing.T) {
 		{"POST", "/panel/api/proxies/clear"},
 		{"POST", "/panel/api/proxies/bulk"},
 		{"POST", "/panel/api/proxies/check"},
+		{"POST", "/panel/api/proxies/purge"},
+		{"POST", "/panel/api/proxies/skipverify_all"},
+		{"POST", "/panel/api/proxies/dead"},
+		{"POST", "/panel/api/proxies/reset_fail"},
+		{"POST", "/panel/api/proxies/threshold"},
 	} {
 		req := httptest.NewRequest(c.method, c.path, strings.NewReader("{}"))
 		rec := httptest.NewRecorder()
@@ -276,5 +281,121 @@ func TestProxiesSkipVerifyAPI(t *testing.T) {
 
 	if code, _ := call(t, pn, "POST", "/panel/api/proxies/skipverify", `{"addr":"9.9.9.9:1080"}`); code != 400 {
 		t.Fatalf("池外代理应 400，实际 %d", code)
+	}
+}
+
+// TestProxiesHealthAPI 代理池健康度运维接口：失效记录透出、一键清除过期代理、
+// 一键免校验、人工标记/复活失效、清除失败记录、阈值设置。
+func TestProxiesHealthAPI(t *testing.T) {
+	pn, pp := newProxyTestPanel(t, "u1", "u2")
+	if code, resp := call(t, pn, "POST", "/panel/api/proxies/add",
+		`{"text":"1.1.1.1:1080\n2.2.2.2:1080\n3.3.3.3:1080"}`); code != 200 || num(t, resp, "added") != 3 {
+		t.Fatalf("add: %d %+v", code, resp)
+	}
+	if err := pp.Assign("u1", "1.1.1.1:1080"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 连续失败达阈值 → 自动换到没用过的 2.2.2.2，1.1.1.1 记为失效。
+	var last proxypool.SwitchResult
+	for i := 0; i < proxypool.DefaultFailThreshold; i++ {
+		res, err := pp.RecordProxyFailure("u1", "1.1.1.1:1080", "dial timeout")
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = res
+	}
+	if !last.Switched || last.To != "socks5://2.2.2.2:1080" {
+		t.Fatalf("自动换代理未生效：%+v", last)
+	}
+
+	// 列表视图：阈值 + 失效统计 + 代理失效字段 + 账号失败计数。
+	code, resp := call(t, pn, "GET", "/panel/api/proxies", "")
+	if code != 200 {
+		t.Fatalf("list: %d", code)
+	}
+	if num(t, resp, "threshold") != float64(proxypool.DefaultFailThreshold) {
+		t.Fatalf("threshold 未透出：%+v", resp)
+	}
+	if num(t, resp, "dead") != 1 {
+		t.Fatalf("dead 统计应为 1：%+v", resp)
+	}
+	pxs, _ := resp["proxies"].([]any)
+	first, _ := pxs[0].(map[string]any)
+	if first["dead"] != true || first["dead_reason"] == nil || first["fail_count"] == nil {
+		t.Fatalf("失效代理字段未透出：%+v", first)
+	}
+	accs, _ := resp["accounts"].([]any)
+	a1, _ := accs[0].(map[string]any)
+	if a1["fail_addr"] == nil || a1["used"] == nil {
+		t.Fatalf("账号失败/用过信息未透出：%+v", a1)
+	}
+
+	// 一键清除过期代理（缺省含探测不通；这里没有探测记录，只清失效的那条）。
+	code, resp = call(t, pn, "POST", "/panel/api/proxies/purge", `{}`)
+	if code != 200 || num(t, resp, "removed") != 1 {
+		t.Fatalf("purge: %d %+v", code, resp)
+	}
+	if pp.Count() != 2 {
+		t.Fatalf("清后应剩 2 条：%d", pp.Count())
+	}
+
+	// 一键免校验：全池打开 → 2 条变更。
+	code, resp = call(t, pn, "POST", "/panel/api/proxies/skipverify_all", `{"skip":true}`)
+	if code != 200 || num(t, resp, "changed") != 2 {
+		t.Fatalf("skipverify_all: %d %+v", code, resp)
+	}
+	for _, px := range pp.List() {
+		if !px.SkipVerify {
+			t.Fatalf("全池应免校验：%+v", px)
+		}
+	}
+	// 只给指定地址关闭。
+	code, resp = call(t, pn, "POST", "/panel/api/proxies/skipverify_all",
+		`{"skip":false,"addrs":["3.3.3.3:1080"]}`)
+	if code != 200 || num(t, resp, "changed") != 1 {
+		t.Fatalf("skipverify_all(addrs): %d %+v", code, resp)
+	}
+	if pp.List()[1].SkipVerify {
+		t.Fatal("3.3.3.3 应已恢复严格校验")
+	}
+
+	// 人工标记 / 复活失效。
+	if code, _ := call(t, pn, "POST", "/panel/api/proxies/dead",
+		`{"addr":"3.3.3.3:1080","dead":true,"reason":"人工停用"}`); code != 200 {
+		t.Fatalf("dead(true): %d", code)
+	}
+	if pp.DeadCount() != 1 {
+		t.Fatal("人工标记未生效")
+	}
+	if code, _ := call(t, pn, "POST", "/panel/api/proxies/dead", `{"addr":"3.3.3.3:1080","dead":false}`); code != 200 {
+		t.Fatalf("dead(false): %d", code)
+	}
+	if pp.DeadCount() != 0 {
+		t.Fatal("复活未生效")
+	}
+
+	// 清除失败记录。
+	if code, resp := call(t, pn, "POST", "/panel/api/proxies/reset_fail", `{"uid":"u1"}`); code != 200 || num(t, resp, "cleared") != 1 {
+		t.Fatalf("reset_fail: %d %+v", code, resp)
+	}
+	if pp.FailureStateOf("u1").Count != 0 {
+		t.Fatal("失败记录未清除")
+	}
+
+	// 阈值设置（含越界拒绝）。
+	if code, resp := call(t, pn, "POST", "/panel/api/proxies/threshold", `{"n":5}`); code != 200 || num(t, resp, "threshold") != 5 {
+		t.Fatalf("threshold: %d %+v", code, resp)
+	}
+	if code, _ := call(t, pn, "POST", "/panel/api/proxies/threshold", `{"n":0}`); code != 400 {
+		t.Fatalf("越界阈值应 400，实际 %d", code)
+	}
+
+	// 池外地址 / 非法地址报错。
+	if code, _ := call(t, pn, "POST", "/panel/api/proxies/dead", `{"addr":"9.9.9.9:1080"}`); code != 400 {
+		t.Fatalf("池外代理应 400，实际 %d", code)
+	}
+	if code, _ := call(t, pn, "POST", "/panel/api/proxies/skipverify_all", `{"addrs":["http://bad:1"]}`); code != 400 {
+		t.Fatalf("非法地址应 400，实际 %d", code)
 	}
 }

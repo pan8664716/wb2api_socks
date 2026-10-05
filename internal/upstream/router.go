@@ -27,13 +27,35 @@ type proxyTLSRouter struct {
 	insecure *http.Transport
 	// skipAll 全局免校验开关（config upstream.tls_skip_verify，面板保存即热生效）。
 	skipAll atomic.Bool
+	// onResult 出站结果回调（可空）：只有「经代理的请求」才会被回调，用于代理池的
+	// 「连续失败自动换代理」归因。err == nil 表示传输层成功（HTTP 状态码不算失败——
+	// 4xx/5xx 是业务错误，不该记到代理头上）。
+	onResult func(req *http.Request, err error)
 }
 
 func (r *proxyTLSRouter) RoundTrip(req *http.Request) (*http.Response, error) {
+	var (
+		resp *http.Response
+		err  error
+	)
 	if r.skipAll.Load() || requestSkipsTLSVerify(req) {
-		return r.insecure.RoundTrip(req)
+		resp, err = r.insecure.RoundTrip(req)
+	} else {
+		resp, err = r.secure.RoundTrip(req)
 	}
-	return r.secure.RoundTrip(req)
+	if r.onResult != nil && proxyAddrOf(req) != "" {
+		r.onResult(req, err)
+	}
+	return resp, err
+}
+
+// proxyAddrOf 取请求 context 里绑定的代理地址（未绑定 = 直连）。
+func proxyAddrOf(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	addr, _ := req.Context().Value(proxyCtxKey{}).(string)
+	return addr
 }
 
 // CloseIdleConnections 清空两条 Transport 的空闲连接池（连接层加固的失败清池路径）。
