@@ -1797,8 +1797,14 @@ function renderUsage(d) {
  * 间隔，也存在 6~8 小时的断档（没请求的时段不产生桶），等距排布会把 8 小时
  * 画得和 1 小时一样宽，让「什么时候用的」完全失真。
  *
- * 另外不再用 preserveAspectRatio="none"：那会把 760 宽的 viewBox 横向拉伸到
- * 容器宽度，柱子和文字都变形。改为固定比例、按容器宽度自适应高度。
+ * 三个踩过的坑，这里都绕开：
+ *  1) 不用 preserveAspectRatio 把 760 宽的 viewBox 横向拉伸到容器宽度——拉伸会
+ *     让 10px 的刻度字跟着放大到 20px+，柱子也被拉扁。改成量出容器的真实像素
+ *     宽度、按 1:1 出图；容器宽度变了就重画（见文件末尾的 resize 监听）。
+ *  2) x 轴刻度不再各自找「最近的柱子」画完就算——数据稀疏时相邻刻度会落到同一
+ *     根或紧挨着的两根柱子上，两个标签直接叠在一起（"14:00" 压 "00:00"）。现在
+ *     按估算的文字宽度做一次碰撞检测，叠了就让位。
+ *  3) 首尾柱子各留半个柱宽的外边距，最右一根不会被容器边缘切掉。
  *
  * 时间轴用本地时间解析（后端返回的就是本地时区），day 点按当天 00:00 参与定位，
  * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
@@ -1812,8 +1818,41 @@ function parsePointTime(p) {
   return isNaN(d.getTime()) ? null : d.getTime();
 }
 
+/* usageDayKey 把时间戳归到「本地日历日」，用来判断跨天。 */
+function usageDayKey(ms) {
+  const d = new Date(ms);
+  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+}
+
+/* usageChartWidth 量出图表可用的真实像素宽度（扣掉容器左右内边距）。
+   量不到（未布局 / 无 DOM）就退回 760，绝不让 NaN 传下去。 */
+function usageChartWidth(host) {
+  let w = Number(host && host.clientWidth);
+  if (Number.isFinite(w) && w > 0 && typeof getComputedStyle === 'function') {
+    const cs = getComputedStyle(host);
+    if (cs) w -= (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+  }
+  if (!Number.isFinite(w) || w <= 0) w = 760;
+  return Math.max(280, Math.round(w));
+}
+
+/* 最近一次画图用的原始序列 + 重画定时器：窗口尺寸变了要按新宽度重画，
+   否则图还是旧宽度算出来的坐标（右侧留白或溢出）。 */
+let usageSeriesCache = null;
+let usageRedrawTimer = 0;
+
+/* usageRedraw 按当前容器宽度重画缓存的序列（防抖，拖窗口时只画最后一帧）。 */
+function usageRedraw() {
+  if (!usageSeriesCache || !usageSeriesCache.length) return;
+  clearTimeout(usageRedrawTimer);
+  usageRedrawTimer = setTimeout(() => {
+    if (usageSeriesCache && usageSeriesCache.length) renderUsageChart(usageSeriesCache);
+  }, 120);
+}
+
 function renderUsageChart(series) {
   const host = $('usChart');
+  usageSeriesCache = series || [];
 
   // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
   const pts = [];
@@ -1830,8 +1869,12 @@ function renderUsageChart(series) {
     return;
   }
 
-  const W = 760, H = 180, PL = 52, PR = 12, PT = 12, PB = 30;
-  const iw = W - PL - PR, ih = H - PT - PB;
+  // 1:1 像素出图：W 取容器实测宽度；H 跟着宽度走并夹在 200~340 之间——太矮柱子
+  // 变扁看不出量级，太高又会在宽面板上留一大片空白。
+  const W = usageChartWidth(host);
+  const H = Math.round(Math.min(340, Math.max(200, W * 0.17)));
+  const PL = 52, PR = 12, PT = 12, PB = 30;
+  const ih = H - PT - PB;
 
   const t0 = pts[0].t;
   const t1 = pts[pts.length - 1].t;
@@ -1844,13 +1887,21 @@ function renderUsageChart(series) {
   let minGap = Infinity;
   for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
   if (!isFinite(minGap) || minGap <= 0) minGap = span;
-  const slot = iw * (minGap / span);
-  const bw = Math.max(1.5, Math.min(30, slot * 0.7));
 
-  const xOf = t => PL + (t - t0) / span * iw;
+  // 柱宽按整幅宽先估一次，再用它反推左右内边距（各留半个柱宽），最后按新内边距
+  // 复算柱宽——否则最右一根柱子会有一半被容器边缘切掉。
+  let bw = 1.5, iw = W - PL - PR, plotL = PL;
+  for (let pass = 0; pass < 2; pass++) {
+    bw = Math.max(1.5, Math.min(30, iw * (minGap / span) * 0.7));
+    const pad = bw / 2 + 1;
+    plotL = PL + pad;
+    iw = Math.max(40, (W - PR - pad) - plotL);
+  }
 
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
-            'preserveAspectRatio="xMidYMid meet">';
+  const xOf = t => plotL + (t - t0) / span * iw;
+
+  let out = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
+            '" role="img">';
 
   // y 轴网格 + 刻度
   for (let i = 0; i <= 4; i++) {
@@ -1883,41 +1934,68 @@ function renderUsageChart(series) {
   out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) +
          '" y2="' + (PT + ih) + '"/>';
 
-  // x 轴刻度：按真实时间等距取 6 个位置，取该位置**最近的实际柱子**做标签，
-  // 所以标签永远落在有数据的点上，不会指到空档里。
-  const TICKS = Math.min(6, pts.length);
-  const usedLabel = new Set();
+  // x 轴刻度：按真实时间等距取若干位置，每个位置取**最近的实际柱子**做标签，
+  // 所以标签永远落在有数据的点上，不会指到空档里。候选选完再做一次碰撞检测：
+  // 相邻两个标签的估算宽度加起来会重叠就丢掉后者（最后一个候选例外，它优先于
+  // 前一个——图右端的信息比中段更值钱）。
+  const TICKS = Math.max(2, Math.min(8, Math.round(iw / 88)));
+  const cands = [];
   for (let k = 0; k < TICKS; k++) {
-    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    const target = t0 + span * (k / (TICKS - 1));
     let bi = 0, best = Infinity;
     for (let i = 0; i < pts.length; i++) {
-      const d = Math.abs(pts[i].t - target);
-      if (d < best) { best = d; bi = i; }
+      const dd = Math.abs(pts[i].t - target);
+      if (dd < best) { best = dd; bi = i; }
     }
-    if (usedLabel.has(bi)) continue;
-    usedLabel.add(bi);
-    const p = pts[bi];
+    if (cands.length && cands[cands.length - 1] === bi) continue;
+    cands.push(bi);
+  }
+
+  const CW = 6.1; // 10px 等宽字体的单字宽度（估值，够用来判重叠）
+  const placed = [];
+  let lastDay = null;
+  for (let i = 0; i < cands.length; i++) {
+    const p = pts[cands[i]];
     const d = new Date(p.t);
-    const lab = p.scope === 'day'
-      ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
-      : String(d.getHours()).padStart(2, '0') + ':00';
-    // 首尾标签靠边对齐，避免被裁掉
-    const cx = xOf(p.t);
-    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
-    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
-           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+    const day = usageDayKey(p.t);
+    let lab;
+    if (p.scope === 'day') {
+      lab = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
+    } else {
+      const hm = String(d.getHours()).padStart(2, '0') + ':00';
+      // 跨天窗口里给每天的首个刻度补上日期，否则一排 "00:00" 分不清是哪天。
+      lab = (lastDay !== null && day !== lastDay)
+        ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') + ' ' + hm
+        : hm;
+    }
+    const w = lab.length * CW + 6;
+    // 贴边时把标签整体挪进绘图区，而不是让它被裁掉。
+    const cx = Math.max(plotL + w / 2, Math.min(W - PR - w / 2, xOf(p.t)));
+    const prev = placed[placed.length - 1];
+    if (prev && cx - prev.cx < (w + prev.w) / 2 + 6) {
+      if (i === cands.length - 1 && placed.length > 1) placed.pop();
+      else continue;
+    }
+    placed.push({ lab: lab, cx: cx, w: w });
+    lastDay = day;
+  }
+  for (const it of placed) {
+    out += '<text class="tk" x="' + it.cx.toFixed(1) + '" y="' + (PT + ih + 15) +
+           '" text-anchor="middle">' + esc(it.lab) + '</text>';
   }
 
   // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
   let prevDay = null;
   for (const p of pts) {
-    const d = new Date(p.t).getDate();
-    if (prevDay !== null && d !== prevDay) {
-      const x = xOf(p.t).toFixed(1);
-      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
-             (PT + ih) + '" style="opacity:.45"/>';
+    const day = usageDayKey(p.t);
+    if (prevDay !== null && day !== prevDay) {
+      const x = xOf(p.t);
+      if (x > PL + 2 && x < W - PR - 2) {
+        out += '<line class="gl" x1="' + x.toFixed(1) + '" y1="' + PT + '" x2="' +
+               x.toFixed(1) + '" y2="' + (PT + ih) + '" style="opacity:.45"/>';
+      }
     }
-    prevDay = d;
+    prevDay = day;
   }
 
   out += '</svg>';
@@ -1938,6 +2016,10 @@ async function loadUsage() {
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
+
+// 时序图是按容器实测宽度 1:1 画的，窗口/侧栏宽度变了要按新宽度重画一次，
+// 否则图还停在旧坐标上（右侧留白或溢出）。防抖交给 usageRedraw。
+addEventListener('resize', usageRedraw);
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」

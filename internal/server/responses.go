@@ -63,6 +63,12 @@ type respTool struct {
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"`
 	Strict      *bool           `json:"strict"`
+	// 命名空间工具（type="namespace"，Codex 多代理协作工具就长这样）：
+	// 名字在 Name，内嵌工具在 Tools。chat 口径没有这个概念，需要拍平/还原。
+	Namespace string     `json:"namespace,omitempty"`
+	Tools     []respTool `json:"tools,omitempty"`
+	// 自由格式工具（type="custom"，如 apply_patch）的语法描述，chat 口径无对应形态。
+	Format json.RawMessage `json:"format,omitempty"`
 }
 
 // respInputItem Responses 的 input 数组元素（只列需要处理的类型）。
@@ -71,6 +77,7 @@ type respInputItem struct {
 	Role      string          `json:"role"`
 	Content   json.RawMessage `json:"content"`
 	Name      string          `json:"name"`
+	Namespace string          `json:"namespace"` // 命名空间工具的归属（如 collaboration）
 	Arguments string          `json:"arguments"`
 	CallID    string          `json:"call_id"`
 	Output    json.RawMessage `json:"output"`
@@ -153,9 +160,14 @@ func inputToMessages(raw json.RawMessage) ([]any, error) {
 	for _, it := range items {
 		switch it.Type {
 		case "function_call":
+			name := it.Name
+			if it.Namespace != "" {
+				// 历史里的命名空间调用要拍回 chat 的工具名，否则与 tools 列表对不上。
+				name = flattenNSName(it.Namespace, it.Name)
+			}
 			pending = append(pending, map[string]any{
 				"id": it.CallID, "type": "function",
-				"function": map[string]any{"name": it.Name, "arguments": it.Arguments},
+				"function": map[string]any{"name": name, "arguments": it.Arguments},
 			})
 		case "function_call_output":
 			flush()
@@ -243,26 +255,96 @@ func textOf(raw json.RawMessage) string {
 	return string(raw)
 }
 
-// respToolsToChat 扁平工具 → chat 嵌套工具；非 function 类型（web_search 等）跳过。
+// ---------------------------------------------------------------------------
+// 命名空间工具（namespace）拍平 / 还原
+//
+// Codex 的多代理协作工具（spawn_agent / send_message / followup_task /
+// wait_agent / interrupt_agent / list_agents）在 Responses 口径里是**一个整体**：
+//
+//	{"type":"namespace","name":"collaboration","tools":[{...spawn_agent...}, ...]}
+//
+// 调用回来时 function_call 项带 `"namespace":"collaboration"`。Chat Completions 没有
+// 命名空间概念，且 function.name 只允许 [a-zA-Z0-9_-]{1,64}（不能出现 '.'），所以：
+//
+//	上行：namespace 工具逐条拍平成 function，名字 <namespace>__<tool>
+//	下行：按拍平名反查，还原出 name + namespace 两个字段
+//
+// 少了这一步：上行整包被丢弃（模型根本看不到 spawn_agent 等工具），下行丢 namespace
+// 字段（Codex 按默认命名空间查表 → router 报 "unsupported call: spawn_agent"）。
+// ---------------------------------------------------------------------------
+
+const nsSep = "__"
+
+type nsToolRef struct{ Namespace, Name string }
+
+// nsToolIndex 拍平名 → 原名映射（只收 namespace 工具的内嵌条目）。
+type nsToolIndex map[string]nsToolRef
+
+func flattenNSName(namespace, name string) string { return namespace + nsSep + name }
+
+func buildNSToolIndex(tools []respTool) nsToolIndex {
+	idx := nsToolIndex{}
+	for _, t := range tools {
+		if t.Type != "namespace" {
+			continue
+		}
+		for _, inner := range t.Tools {
+			if inner.Name == "" {
+				continue
+			}
+			idx[flattenNSName(t.Name, inner.Name)] = nsToolRef{Namespace: t.Name, Name: inner.Name}
+		}
+	}
+	return idx
+}
+
+// resolveToolName 把上游回来的 function 名拆回 (namespace, name)；非命名空间工具返回 ("", 原名)。
+func (idx nsToolIndex) resolveToolName(flat string) (string, string) {
+	if ref, ok := idx[flat]; ok {
+		return ref.Namespace, ref.Name
+	}
+	return "", flat
+}
+
+// respToolsToChat 扁平工具 → chat 嵌套工具。
+//   - type="function"（或空）原样转换；
+//   - type="namespace" 逐条拍平成 function（名字 <namespace>__<tool>），响应侧再还原；
+//   - 其余类型（custom / web_search / mcp 等）chat 口径无对应形态，跳过。
 func respToolsToChat(tools []respTool) []any {
 	out := make([]any, 0, len(tools))
 	for _, t := range tools {
-		if t.Type != "" && t.Type != "function" {
-			continue
+		switch t.Type {
+		case "namespace":
+			for _, inner := range t.Tools {
+				if fn := chatFunction(flattenNSName(t.Name, inner.Name), inner); fn != nil {
+					out = append(out, fn)
+				}
+			}
+		case "", "function":
+			if fn := chatFunction(t.Name, t); fn != nil {
+				out = append(out, fn)
+			}
 		}
-		fn := map[string]any{"name": t.Name}
-		if t.Description != "" {
-			fn["description"] = t.Description
-		}
-		if len(t.Parameters) > 0 {
-			fn["parameters"] = json.RawMessage(t.Parameters)
-		}
-		if t.Strict != nil {
-			fn["strict"] = *t.Strict
-		}
-		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	return out
+}
+
+// chatFunction 单个 function 工具 → chat 嵌套形态；名字为空返回 nil。
+func chatFunction(name string, t respTool) map[string]any {
+	if name == "" {
+		return nil
+	}
+	fn := map[string]any{"name": name}
+	if t.Description != "" {
+		fn["description"] = t.Description
+	}
+	if len(t.Parameters) > 0 {
+		fn["parameters"] = json.RawMessage(t.Parameters)
+	}
+	if t.Strict != nil {
+		fn["strict"] = *t.Strict
+	}
+	return map[string]any{"type": "function", "function": fn}
 }
 
 // respToolChoiceToChat "auto"/"none"/"required" 原样透传；{type:"function",name} → 嵌套形态。
@@ -353,7 +435,8 @@ func usageToResponses(u map[string]any) map[string]any {
 
 // messageToOutputItems 把一条 chat message 翻译成 Responses 的 output 项数组
 // （文本消息一项 + 每个 tool_call 一项）。
-func messageToOutputItems(msg map[string]any) []any {
+// ns 用于把拍平的命名空间工具名还原成 name + namespace（Codex 多代理工具必需）。
+func messageToOutputItems(msg map[string]any, ns nsToolIndex) []any {
 	out := make([]any, 0, 2)
 	if s, _ := msg["content"].(string); strings.TrimSpace(s) != "" {
 		out = append(out, map[string]any{
@@ -377,10 +460,17 @@ func messageToOutputItems(msg map[string]any) []any {
 			if callID == "" {
 				callID = newItemID("call")
 			}
-			out = append(out, map[string]any{
+			item := map[string]any{
 				"type": "function_call", "id": newItemID("fc"), "call_id": callID,
 				"name": name, "arguments": args, "status": "completed",
-			})
+			}
+			if namespace, plain := ns.resolveToolName(name); namespace != "" {
+				item["name"] = plain
+				item["namespace"] = namespace
+				// 协作类工具的明文参数走这个标记（Codex 用它区分明文/加密参数）。
+				item["encrypted_function_args"] = []any{}
+			}
+			out = append(out, item)
 		}
 	}
 	return out
@@ -397,7 +487,7 @@ func chatToResponses(raw []byte, req respRequest, respID string) (map[string]any
 	if choices, ok := chat["choices"].([]any); ok && len(choices) > 0 {
 		if ch, ok := choices[0].(map[string]any); ok {
 			if msg, ok := ch["message"].(map[string]any); ok {
-				output = messageToOutputItems(msg)
+				output = messageToOutputItems(msg, buildNSToolIndex(req.Tools))
 			}
 		}
 	}
@@ -488,16 +578,19 @@ type responsesStreamer struct {
 	toolIDs  map[int]string
 	toolIdx  map[int]int
 	toolName map[int]string
+	toolNS   map[int]string // 每个工具项的命名空间（空串=普通 function）
 	toolArgs map[int]*strings.Builder
 	callIDs  map[int]string
 	toolSeq  []int
+	ns       nsToolIndex // 拍平名 → 原名（命名空间工具还原用）
 }
 
 func newResponsesStreamer(w http.ResponseWriter, fl http.Flusher, req respRequest, respID string) *responsesStreamer {
 	return &responsesStreamer{
 		w: w, fl: fl, req: req, respID: respID, created: time.Now().Unix(),
 		toolIDs: map[int]string{}, toolIdx: map[int]int{}, toolName: map[int]string{},
-		toolArgs: map[int]*strings.Builder{}, callIDs: map[int]string{}, textIdx: -1,
+		toolNS: map[int]string{}, toolArgs: map[int]*strings.Builder{}, callIDs: map[int]string{},
+		textIdx: -1, ns: buildNSToolIndex(req.Tools),
 	}
 }
 
@@ -658,15 +751,22 @@ func (s *responsesStreamer) handleChunk(chunk map[string]any) {
 				if fn != nil {
 					name, _ = fn["name"].(string)
 				}
-				s.toolName[idx] = name
+				namespace, plain := s.ns.resolveToolName(name)
+				s.toolName[idx] = plain
+				s.toolNS[idx] = namespace
 				s.callIDs[idx] = callID
 				s.toolArgs[idx] = &strings.Builder{}
+				item := map[string]any{
+					"type": "function_call", "id": id, "call_id": callID,
+					"name": plain, "arguments": "", "status": "in_progress",
+				}
+				if namespace != "" {
+					item["namespace"] = namespace
+					item["encrypted_function_args"] = []any{}
+				}
 				s.emit("response.output_item.added", map[string]any{
 					"output_index": s.toolIdx[idx],
-					"item": map[string]any{
-						"type": "function_call", "id": id, "call_id": callID,
-						"name": name, "arguments": "", "status": "in_progress",
-					},
+					"item":         item,
 				})
 			}
 			if fn != nil {
@@ -699,6 +799,10 @@ func (s *responsesStreamer) closeToolItems() {
 		item := map[string]any{
 			"type": "function_call", "id": id, "call_id": callID, "name": s.toolName[idx],
 			"arguments": args, "status": "completed",
+		}
+		if namespace := s.toolNS[idx]; namespace != "" {
+			item["namespace"] = namespace
+			item["encrypted_function_args"] = []any{}
 		}
 		s.output = append(s.output, item)
 		s.emit("response.output_item.done", map[string]any{"output_index": s.toolIdx[idx], "item": item})

@@ -594,10 +594,12 @@ codex exec "只回答两个字：你好"     # 自检
 
 | 方向 | 映射 |
 |---|---|
-| 请求 | `instructions` → system 消息；`input` 数组项（`message` / `function_call` / `function_call_output`）→ `messages`（连续 `function_call` 合并为一条 assistant 的 `tool_calls`；`function_call_output` → `role=tool`）；扁平工具 `{type:"function",name,...}` → 嵌套 `{type:"function",function:{...}}`；`reasoning.effort` → `reasoning_effort`；`max_output_tokens` → `max_tokens` |
-| 响应 | `output` 项：文本 → `message` + `output_text`；工具调用 → `function_call`（`call_id` / `name` / `arguments` 原样透传）；`usage`：`prompt_tokens`/`completion_tokens` → `input_tokens`/`output_tokens`（含 `*_tokens_details`） |
+| 请求 | `instructions` → system 消息；`input` 数组项（`message` / `function_call` / `function_call_output`）→ `messages`（连续 `function_call` 合并为一条 assistant 的 `tool_calls`；`function_call_output` → `role=tool`；带 `namespace` 的调用按 `namespace__name` 拍平）；扁平工具 `{type:"function",name,...}` → 嵌套 `{type:"function",function:{...}}`；**命名空间工具** `{type:"namespace",name:"collaboration",tools:[...]}` → 逐条拍平成 `{type:"function"}`（名字 `<namespace>__<tool>`，chat 的 `function.name` 不允许 `.`）；`reasoning.effort` → `reasoning_effort`；`max_output_tokens` → `max_tokens` |
+| 响应 | `output` 项：文本 → `message` + `output_text`；工具调用 → `function_call`（`call_id` / `name` / `arguments` 原样透传，**拍平名还原出 `name` + `namespace` 两个字段**，并补 `encrypted_function_args: []`）；`usage`：`prompt_tokens`/`completion_tokens` → `input_tokens`/`output_tokens`（含 `*_tokens_details`） |
 | 流式 | `response.created` / `response.in_progress` / `output_item.added` / `content_part.added` / `output_text.delta`* / `output_text.done` / `content_part.done` / `output_item.done` / `function_call_arguments.delta`* / `function_call_arguments.done` / `response.completed`，`sequence_number` 严格递增 |
 | 错误 | 上游失败（非 2xx）→ 原状态码 + OpenAI 错误信封原样透出（客户端按 HTTP 错误处理与重试）；流中错误帧 → `response.failed` |
+
+> **多代理（subagents）**：Codex 的多代理工具在 Responses 口径里是**一个** `{"type":"namespace","name":"collaboration","tools":[...]}` 工具包（`spawn_agent` / `send_message` / `followup_task` / `wait_agent` / `interrupt_agent` / `list_agents`），调用回来时 `function_call` 项带 `"namespace":"collaboration"`。适配层负责拍平（上行）/还原（下行）：缺了它，上游看不到这些工具（`type:"namespace"` 会被当非 function 丢弃），且 Codex 的 router 因缺 `namespace` 按默认命名空间查表失败，直接报 `unsupported call: spawn_agent` —— 表现就是「Codex 不支持 subagents」。
 
 ### 其它客户端
 
